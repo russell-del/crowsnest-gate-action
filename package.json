@@ -1,0 +1,19 @@
+{
+  "name": "crowsnest-gate-action",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GitHub Action that blocks a deploy unless a CrowsNest pipeline gate passes.",
+  "main": "src/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "ncc build src/main.js -o dist --license licenses.txt",
+    "test:local": "node src/main.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@actions/core": "^1.11.1"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.3"
+  }
+}

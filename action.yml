@@ -1,0 +1,46 @@
+name: 'CrowsNest Release Gate'
+description: 'Block a deploy unless your CrowsNest pipeline gate decides the release is safe to ship.'
+author: 'CrowsNest Security'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-url:
+    description: 'Base URL of your CrowsNest api-server (e.g. https://crowsnest.internal:8000). No trailing slash.'
+    required: true
+  app-id:
+    description: 'CrowsNest application id (e.g. app-9MZI).'
+    required: true
+  pipeline-name:
+    description: 'Name of the CrowsNest pipeline to run (e.g. payments-api-release).'
+    required: true
+  token:
+    description: 'JWT for a CrowsNest client (service account). Use a GitHub Actions secret.'
+    required: true
+  console-base-url:
+    description: 'Optional console URL for human-friendly run-detail links (e.g. https://console.crowsnest.internal). If omitted, derived from api-url.'
+    required: false
+    default: ''
+  warn-as-failure:
+    description: 'When true, a `warn` decision fails the step. Default: warn is reported as a GHA warning but the step still passes.'
+    required: false
+    default: 'false'
+  timeout-seconds:
+    description: 'HTTP timeout for the gate request.'
+    required: false
+    default: '60'
+
+outputs:
+  decision:
+    description: 'The pipeline-level decision: go | warn | no-go.'
+  run-id:
+    description: 'CrowsNest pipelinerun _id.'
+  run-url:
+    description: 'Link to the pipeline run detail page in the console.'
+  duration-ms:
+    description: 'How long the gate took to evaluate, in ms.'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'

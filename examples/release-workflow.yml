@@ -1,0 +1,42 @@
+# Drop this file into .github/workflows/ in your service repo.
+#
+# Required secrets (Settings → Secrets and variables → Actions):
+#   CROWSNEST_TOKEN — JWT for a Crowsnest Client (service account)
+#
+# Required vars (or hardcode the URLs below):
+#   CROWSNEST_API_URL      — e.g. https://crowsnest.your-company.internal:8000
+#   CROWSNEST_CONSOLE_URL  — e.g. https://console.your-company.internal:3000
+
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: ./gradlew clean bootJar test
+
+      - name: Container build + push
+        run: |
+          docker buildx build \
+            -t registry.internal/payments-api:${{ github.ref_name }} \
+            --push .
+
+      - name: CrowsNest Release Gate
+        id: gate
+        uses: russell-del/crowsnest-gate-action@v1
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: app-9MZI
+          pipeline-name: payments-api-release
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: Deploy
+        # Only runs if the gate step above passed (go) or warned without warn-as-failure.
+        run: kubectl apply -f deploy.yaml
