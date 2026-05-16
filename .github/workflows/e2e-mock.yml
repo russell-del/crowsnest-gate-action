@@ -1,0 +1,91 @@
+name: e2e-mock
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Mock api-server runs in-process; cases iterate decisions.
+jobs:
+  cases:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - { decision: 'go',    warn_as_failure: 'false', expected_outcome: 'success' }
+          - { decision: 'warn',  warn_as_failure: 'false', expected_outcome: 'success' }
+          - { decision: 'warn',  warn_as_failure: 'true',  expected_outcome: 'failure' }
+          - { decision: 'no-go', warn_as_failure: 'false', expected_outcome: 'failure' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start mock api-server
+        run: |
+          cat > /tmp/mock-api.py <<'PYEOF'
+          import http.server, json, os, sys
+          DECISION = os.environ['MOCK_DECISION']
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  if '/api/pipeline/run/' not in self.path:
+                      self.send_response(404); self.end_headers(); return
+                  body = {
+                      'appId': 'app-test',
+                      'pipelineName': 'mock',
+                      'decision': DECISION,
+                      'runId': 'mock-run-123',
+                      'durationMs': 42,
+                      'stages': [
+                          {'name': 'Build Gate', 'gateName': 'build-gate', 'decision': DECISION,
+                           'score': 1 if DECISION == 'go' else 0, 'onFail': 'block',
+                           'failureReasons': [] if DECISION == 'go' else ['required_failed'],
+                           'checks': [
+                               {'name': 'mocked check', 'decision': 'pass' if DECISION == 'go' else 'fail',
+                                'kind': 'required', 'weight': 1, 'message': f'decision={DECISION}'},
+                           ]},
+                      ],
+                  }
+                  status = 200 if DECISION in ('go', 'warn') else 422
+                  payload = json.dumps(body).encode()
+                  self.send_response(status)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(payload)))
+                  self.end_headers()
+                  self.wfile.write(payload)
+              def log_message(self, *a, **k): pass
+          port = int(os.environ.get('PORT', '8080'))
+          http.server.HTTPServer(('127.0.0.1', port), H).serve_forever()
+          PYEOF
+          MOCK_DECISION='${{ matrix.case.decision }}' PORT=8080 python3 /tmp/mock-api.py &
+          # wait for the port to accept connections
+          for i in $(seq 1 30); do
+            curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080/api/pipeline/run/x/y && break || sleep 0.2
+          done
+
+      - name: Run the action (decision=${{ matrix.case.decision }} warn-as-failure=${{ matrix.case.warn_as_failure }})
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          api-url: http://127.0.0.1:8080
+          app-id: app-test
+          pipeline-name: mock
+          token: not-a-real-token-but-mock-ignores-it
+          warn-as-failure: ${{ matrix.case.warn_as_failure }}
+
+      - name: Assert outcome matches expectation
+        run: |
+          actual='${{ steps.gate.outcome }}'
+          expected='${{ matrix.case.expected_outcome }}'
+          echo "decision='${{ matrix.case.decision }}' warn-as-failure='${{ matrix.case.warn_as_failure }}'"
+          echo "expected step outcome: $expected"
+          echo "actual step outcome:   $actual"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::expected $expected, got $actual"
+            exit 1
+          fi
+          # And verify outputs were emitted
+          [[ "${{ steps.gate.outputs.decision }}" == "${{ matrix.case.decision }}" ]] || { echo "::error::decision output mismatch"; exit 1; }
+          [[ "${{ steps.gate.outputs.run-id }}" == "mock-run-123" ]] || { echo "::error::run-id output mismatch"; exit 1; }
+          echo "✓ outcome + outputs both match"

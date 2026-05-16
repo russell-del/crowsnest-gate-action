@@ -1,0 +1,54 @@
+name: e2e-real
+# Manually-triggered end-to-end against a real CrowsNest api-server.
+#
+# Requires:
+#   * a self-hosted runner with the label `crowsnest-net` that has network
+#     reachability to the CrowsNest api-server (the test target isn't on
+#     the public internet), OR change `runs-on:` if your api is public
+#   * vars.CROWSNEST_API_URL     (e.g. http://crowsnest-test.gusszz.lab:18000)
+#   * vars.CROWSNEST_CONSOLE_URL (e.g. http://crowsnest-test.gusszz.lab:13000)
+#   * secrets.CROWSNEST_TOKEN    — JWT for a CrowsNest Client (or admin user)
+#
+# Usage:
+#   gh workflow run e2e-real.yml -f pipeline-name=payments-api-hotfix -f app-id=app-9MZI
+
+on:
+  workflow_dispatch:
+    inputs:
+      app-id:
+        description: 'CrowsNest application id'
+        required: true
+        default: 'app-9MZI'
+      pipeline-name:
+        description: 'CrowsNest pipeline name'
+        required: true
+        default: 'payments-api-hotfix'
+      warn-as-failure:
+        description: 'Treat warn as failure'
+        type: boolean
+        default: false
+
+jobs:
+  gate:
+    runs-on: [self-hosted, crowsnest-net]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CrowsNest Release Gate
+        id: gate
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ inputs.app-id }}
+          pipeline-name: ${{ inputs.pipeline-name }}
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+          warn-as-failure: ${{ inputs.warn-as-failure }}
+
+      - name: Show outputs
+        if: always()
+        run: |
+          echo "decision:    ${{ steps.gate.outputs.decision }}"
+          echo "run-id:      ${{ steps.gate.outputs.run-id }}"
+          echo "run-url:     ${{ steps.gate.outputs.run-url }}"
+          echo "duration-ms: ${{ steps.gate.outputs.duration-ms }}"
