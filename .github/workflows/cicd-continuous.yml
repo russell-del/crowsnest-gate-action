@@ -1,0 +1,186 @@
+# cicd-continuous.yml — DEMO: continuous gating with 10 CrowsNest checks
+# interleaved into a realistic release workflow.
+#
+# What this demonstrates:
+#   Instead of one big gate at the end of the pipeline ("did everything pass?"),
+#   we have ten small gates between each pair of build/test/deploy steps.
+#   If any gate blocks, the workflow stops *at that exact step*, before any
+#   subsequent work happens. That's the value of continuous gating:
+#   fail fast, fail informative, save downstream compute.
+#
+# Architecture:
+#   - 10 CrowsNest pipelines (one per stage), each containing one gate
+#   - Each gate references 1-2 OPA policy checks
+#   - This workflow calls the action 10 times — `cicd-stage-NN-<name>`
+#   - The action exits 0 (continue) or 1 (block, workflow stops)
+#
+# Requires (set via repo Settings → Secrets and variables → Actions):
+#   secrets.CROWSNEST_TOKEN  — admin/client JWT for CrowsNest api
+#   vars.CROWSNEST_API_URL   — e.g. http://crowsnest-test.gusszz.lab:18000
+#   vars.CROWSNEST_CONSOLE_URL — e.g. http://crowsnest-test.gusszz.lab:13000
+#
+# Runs on the self-hosted runner labelled `crowsnest-net`.
+
+name: cicd-continuous (10-stage demo)
+on:
+  workflow_dispatch:
+
+env:
+  CN_APP: app-CICD
+
+jobs:
+  release:
+    runs-on: [self-hosted, crowsnest-net]
+    steps:
+      - name: 'Step 1a — checkout'
+        uses: actions/checkout@v4
+
+      - name: 'Gate 1 — repo hygiene (branch protection, CODEOWNERS)'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-01-repo-hygiene
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 2a — lint + format'
+        run: |
+          echo "$ ./gradlew spotlessCheck checkstyleMain"
+          sleep 1
+          echo "no style violations"
+
+      - name: 'Gate 2 — source secrets'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-02-source-secrets
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 3a — install dependencies'
+        run: |
+          echo "$ ./gradlew dependencies --refresh-dependencies"
+          sleep 1
+          echo "184 dependencies resolved"
+
+      - name: 'Gate 3 — dependency vulnerabilities'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-03-dep-vuln
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 4a — unit tests'
+        run: |
+          echo "$ ./gradlew test"
+          sleep 1
+          echo "127 tests, 0 failures"
+
+      - name: 'Gate 4 — tests passed'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-04-tests-passed
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 5a — code coverage'
+        run: |
+          echo "$ ./gradlew jacocoTestReport"
+          sleep 1
+          echo "coverage: 87.4% (>80% threshold)"
+
+      - name: 'Gate 5 — coverage check'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-05-coverage
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 6a — container build'
+        run: |
+          echo "$ docker buildx build -t registry.internal/payments-api:${{ github.run_number }} ."
+          sleep 1
+          echo "image built: sha256:7d2c1f9e84a6..."
+
+      - name: 'Gate 6 — image built (posture)'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-06-image-built
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 7a — container scan'
+        run: |
+          echo "$ trivy image --severity CRITICAL,HIGH registry.internal/payments-api:${{ github.run_number }}"
+          sleep 1
+          echo "0 Critical, 0 High"
+
+      - name: 'Gate 7 — image clean (no Critical CVEs)'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-07-image-clean
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 8a — push image + deploy to staging'
+        run: |
+          echo "$ docker push registry.internal/payments-api:${{ github.run_number }}"
+          echo "$ kubectl apply -n staging -f deploy.yaml"
+          sleep 1
+          echo "staging rollout complete"
+
+      - name: 'Gate 8 — staging ready (TLS endpoints healthy)'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-08-staging-ready
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 9a — staging smoke tests'
+        run: |
+          echo "$ ./gradlew :smoke:test -Pstaging"
+          sleep 1
+          echo "all smoke tests passed"
+
+      - name: 'Gate 9 — prod readiness (MSSQL TDE + AD identities)'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-09-prod-readiness
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Step 10a — production deploy'
+        run: |
+          echo "$ kubectl apply -n prod -f deploy.yaml"
+          sleep 1
+          echo "production rollout complete"
+
+      - name: 'Gate 10 — post-deploy validation'
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: ${{ env.CN_APP }}
+          pipeline-name: cicd-stage-10-post-deploy
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+
+      - name: 'Done — release shipped'
+        run: |
+          echo "Release ${{ github.run_number }} of payments-api passed all 10 CrowsNest gates."
+          echo "Each gate's run detail is linked in the corresponding step's annotations."
