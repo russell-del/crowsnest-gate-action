@@ -18,11 +18,11 @@ on:
       app-id:
         description: 'CrowsNest application id'
         required: true
-        default: 'app-9MZI'
+        default: 'app-ACME'
       pipeline-name:
         description: 'CrowsNest pipeline name'
         required: true
-        default: 'payments-api-hotfix'
+        default: 'acme-payments-release'
       warn-as-failure:
         description: 'Treat warn as failure'
         type: boolean
