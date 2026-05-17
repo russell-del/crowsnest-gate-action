@@ -1,0 +1,92 @@
+# Demo customer workflow: ACME Payments
+#
+# This is the full pipeline a customer would have in their service repo's
+# .github/workflows/release.yml — the kind of thing Plinko CI mocks for a
+# booth demo. Every step except the CrowsNest Release Gate is the customer's
+# normal build/test/package/deploy work; the gate is a one-line drop-in
+# that decides whether the deploy stage runs.
+#
+# Backed by these CrowsNest resources on the test cluster:
+#   app:           app-ACME  ("ACME Payments (GHA Demo)")
+#   pipeline:      acme-payments-release  (Build Gate block + Release Gate warn)
+#   gates:         build-gate, release-gate
+#   checks: TLS 1.3 transport, MSSQL TDE, AD compliance, Vuln Scanner posture,
+#           No unpatched Critical CVEs
+#
+# To run this in your own repo:
+#   1. Set repo secrets/vars (Settings -> Secrets and variables -> Actions):
+#        - secrets.CROWSNEST_TOKEN     — JWT for a CrowsNest Client (service account)
+#        - vars.CROWSNEST_API_URL      — e.g. https://crowsnest.your-co.internal:8000
+#        - vars.CROWSNEST_CONSOLE_URL  — e.g. https://console.your-co.internal:13000
+#   2. GitHub-hosted runners cannot reach a private lab — point at a public
+#      api, run a self-hosted runner inside your network, or use a tunnel.
+
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      override-decision-with-warn-as-failure:
+        description: 'Treat a `warn` decision as failure (block deploy on warn)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          echo "$ ./gradlew clean bootJar"
+          sleep 1
+          echo "BUILD SUCCESSFUL · payments-api-${{ github.ref_name || '0.0.0' }}.jar"
+
+      - name: Unit tests
+        run: |
+          echo "$ ./gradlew test"
+          sleep 1
+          echo "127 tests, 0 failures, 0 skipped · coverage 87.4%"
+
+      - name: Container build + sign + push
+        run: |
+          echo "$ docker buildx build -t registry.internal/payments-api:${{ github.ref_name || '0.0.0' }} --push ."
+          sleep 1
+          echo "$ cosign sign --yes registry.internal/payments-api:${{ github.ref_name || '0.0.0' }}"
+          sleep 1
+          echo "Pushed and signed."
+
+      # ─────────────────────────────────────────────────────────────
+      #                   THE ONE STEP THAT'S "US"
+      # ─────────────────────────────────────────────────────────────
+      - name: CrowsNest Release Gate
+        id: gate
+        uses: russell-del/crowsnest-gate-action@v1
+        with:
+          api-url: ${{ vars.CROWSNEST_API_URL }}
+          app-id: app-ACME
+          pipeline-name: acme-payments-release
+          token: ${{ secrets.CROWSNEST_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
+          warn-as-failure: ${{ inputs.override-decision-with-warn-as-failure || 'false' }}
+
+      # If `gate` fails (no-go, or warn with warn-as-failure=true) the job
+      # stops here — deploy never runs.
+
+      - name: Deploy to k8s
+        run: |
+          echo "$ kubectl apply -f k8s/payments-api.yaml"
+          sleep 1
+          echo "Rollout started for payments-api-${{ github.ref_name || '0.0.0' }}"
+
+      - name: Comment on commit with gate result
+        if: always()
+        run: |
+          echo "Gate decision: ${{ steps.gate.outputs.decision }}"
+          echo "Run detail:    ${{ steps.gate.outputs.run-url }}"
+          echo "Duration:      ${{ steps.gate.outputs.duration-ms }}ms"
