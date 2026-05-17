@@ -1,0 +1,11 @@
+# CODEOWNERS for crowsnest-gate-action
+# Required reviewers for changes anywhere in the repo.
+*               @russell-del
+
+# Action-handler hot path needs extra eyes
+/src/           @russell-del
+/dist/          @russell-del
+/action.yml     @russell-del
+
+# Workflow infra
+/.github/       @russell-del
