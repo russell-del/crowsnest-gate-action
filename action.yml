@@ -15,6 +15,10 @@ inputs:
   pipeline-name:
     description: 'Name of the CrowsNest pipeline to run (e.g. payments-api-release).'
     required: true
+  stage-name:
+    description: 'Optional. Evaluate only this single stage from the pipeline (continuous-gating pattern). Match by stage name or gate name. Omit to evaluate the entire pipeline.'
+    required: false
+    default: ''
   token:
     description: 'JWT for a CrowsNest client (service account). Use a GitHub Actions secret.'
     required: true

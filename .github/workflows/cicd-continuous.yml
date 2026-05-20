@@ -1,25 +1,23 @@
-# cicd-continuous.yml — DEMO: continuous gating with 10 CrowsNest checks
-# interleaved into a realistic release workflow.
+# cicd-continuous.yml — DEMO: continuous gating with 10 stages of a SINGLE
+# CrowsNest pipeline (acme-cicd-release).
 #
-# What this demonstrates:
-#   Instead of one big gate at the end of the pipeline ("did everything pass?"),
-#   we have ten small gates between each pair of build/test/deploy steps.
-#   If any gate blocks, the workflow stops *at that exact step*, before any
-#   subsequent work happens. That's the value of continuous gating:
-#   fail fast, fail informative, save downstream compute.
+# This shows the customer-facing pattern after the action gained `stage-name`
+# support (v0.2.0): one pipeline, 10 stages, the customer's workflow calls
+# the action 10 times with the same pipeline-name and a different
+# stage-name each call. CrowsNest's console then shows ONE pipeline with
+# 10 stages instead of 10 disconnected pipelines.
 #
-# Architecture:
-#   - 10 CrowsNest pipelines (one per stage), each containing one gate
-#   - Each gate references 1-2 OPA policy checks
-#   - This workflow calls the action 10 times — `cicd-stage-NN-<name>`
-#   - The action exits 0 (continue) or 1 (block, workflow stops)
+# Behaviour preserved from the multi-pipeline version:
+#   * each action call returns its own pass/fail and halts the workflow
+#     on failure
+#   * the workflow stops at the EARLIEST stage that detects a problem
+#   * each stage produces its own pipelinerun record (tagged with
+#     pipelineMeta.stage = "<stage-name>") under the same pipeline
 #
-# Requires (set via repo Settings → Secrets and variables → Actions):
-#   secrets.CROWSNEST_TOKEN  — admin/client JWT for CrowsNest api
-#   vars.CROWSNEST_API_URL   — e.g. http://crowsnest-test.gusszz.lab:18000
-#   vars.CROWSNEST_CONSOLE_URL — e.g. http://crowsnest-test.gusszz.lab:13000
-#
-# Runs on the self-hosted runner labelled `crowsnest-net`.
+# Requires (Settings → Secrets and variables → Actions):
+#   secrets.CROWSNEST_TOKEN     — admin/client JWT for the api
+#   vars.CROWSNEST_API_URL      — http://crowsnest-test.gusszz.lab:18000
+#   vars.CROWSNEST_CONSOLE_URL  — http://crowsnest-test.gusszz.lab:13000
 
 name: cicd-continuous (10-stage demo)
 on:
@@ -27,6 +25,7 @@ on:
 
 env:
   CN_APP: app-CICD
+  CN_PIPE: acme-cicd-release   # ← single pipeline; the stage-name input picks the stage
 
 jobs:
   release:
@@ -40,7 +39,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-01-repo-hygiene
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: repo-hygiene
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -55,7 +55,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-02-source-secrets
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: source-secrets
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -70,7 +71,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-03-dep-vuln
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: dep-vuln
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -85,7 +87,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-04-tests-passed
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: tests-passed
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -100,7 +103,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-05-coverage
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: coverage
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -115,7 +119,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-06-image-built
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: image-built
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -130,7 +135,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-07-image-clean
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: image-clean
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -146,7 +152,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-08-staging-ready
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: staging-ready
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -161,7 +168,8 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-09-prod-readiness
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: prod-readiness
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
@@ -176,11 +184,11 @@ jobs:
         with:
           api-url: ${{ vars.CROWSNEST_API_URL }}
           app-id: ${{ env.CN_APP }}
-          pipeline-name: cicd-stage-10-post-deploy
+          pipeline-name: ${{ env.CN_PIPE }}
+          stage-name: post-deploy
           token: ${{ secrets.CROWSNEST_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_CONSOLE_URL }}
 
       - name: 'Done — release shipped'
         run: |
-          echo "Release ${{ github.run_number }} of payments-api passed all 10 CrowsNest gates."
-          echo "Each gate's run detail is linked in the corresponding step's annotations."
+          echo "Release ${{ github.run_number }} of payments-api passed all 10 stages of acme-cicd-release."

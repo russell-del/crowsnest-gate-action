@@ -72,6 +72,7 @@ async function run() {
     const apiUrl = core.getInput('api-url', { required: true }).replace(/\/+$/, '');
     const appId = core.getInput('app-id', { required: true });
     const pipelineName = core.getInput('pipeline-name', { required: true });
+    const stageName = core.getInput('stage-name') || '';
     const token = core.getInput('token', { required: true });
     const consoleBaseInput = core.getInput('console-base-url');
     const warnAsFailure = core.getInput('warn-as-failure').toLowerCase() === 'true';
@@ -79,7 +80,8 @@ async function run() {
 
     core.setSecret(token);
 
-    const url = `${apiUrl}/api/pipeline/run/${encodeURIComponent(appId)}/${encodeURIComponent(pipelineName)}`;
+    const base = `${apiUrl}/api/pipeline/run/${encodeURIComponent(appId)}/${encodeURIComponent(pipelineName)}`;
+    const url = stageName ? `${base}?stage=${encodeURIComponent(stageName)}` : base;
     core.info(`POST ${url}`);
 
     const controller = new AbortController();
