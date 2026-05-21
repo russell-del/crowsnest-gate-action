@@ -1,0 +1,48 @@
+# e2e-public.yml — single-gate end-to-end against the publicly-reachable
+# CrowsNest install at 152.228.243.192. Runs on GitHub-hosted ubuntu-latest
+# (no self-hosted runner needed since the api is internet-accessible).
+#
+# Counterpart to e2e-real.yml (which targets the private lab via a
+# self-hosted runner).
+
+name: e2e-public
+on:
+  workflow_dispatch:
+    inputs:
+      app-id:
+        description: 'CrowsNest application id'
+        required: true
+        default: 'app-ACME'
+      pipeline-name:
+        description: 'CrowsNest pipeline name'
+        required: true
+        default: 'acme-payments-release'
+      warn-as-failure:
+        description: 'Treat warn as failure'
+        type: boolean
+        default: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CrowsNest Release Gate
+        id: gate
+        uses: ./
+        with:
+          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          app-id: ${{ inputs.app-id }}
+          pipeline-name: ${{ inputs.pipeline-name }}
+          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+          warn-as-failure: ${{ inputs.warn-as-failure }}
+
+      - name: Show outputs
+        if: always()
+        run: |
+          echo "decision:    ${{ steps.gate.outputs.decision }}"
+          echo "run-id:      ${{ steps.gate.outputs.run-id }}"
+          echo "run-url:     ${{ steps.gate.outputs.run-url }}"
+          echo "duration-ms: ${{ steps.gate.outputs.duration-ms }}"
