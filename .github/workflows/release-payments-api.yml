@@ -126,6 +126,9 @@ jobs:
           api-url:      ${{ vars.CROWSNEST_PUBLIC_API_URL }}
           token:        ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
           app-id:       ${{ inputs.app-id || 'app-ACME' }}
+          # Required because the api-server's check compares req.user.orgId (ObjectId)
+          # against the body's orgId (string); omitting it triggers a type-mismatch 403.
+          org-id:       '69e292d39fcbcce79bd877ad'
           image:        ${{ env.REGISTRY }}/${{ env.IMAGE }}
           image-digest: ${{ steps.build.outputs.digest }}
           trivy-file:   /tmp/trivy.json
