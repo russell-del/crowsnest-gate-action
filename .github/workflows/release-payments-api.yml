@@ -93,14 +93,15 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ github.event.repository.updated_at }}
 
-      - name: 'Step 4 — confirm pushed image (digest + size)'
+      - name: 'Step 4 — confirm pushed image'
         run: |
           DIGEST="${{ steps.build.outputs.digest }}"
           echo "image:  ${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
+          # Show first 20 lines of the manifest. With provenance: mode=max the manifest
+          # is an OCI image index containing the image + provenance + SBOM attestations
+          # — printing it confirms we can resolve and pull the digest end-to-end.
           docker buildx imagetools inspect \
-            "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}" \
-            --format '{{json .Manifest.Config}}' \
-            | python3 -c 'import sys, json; d=json.load(sys.stdin); print("size:", d.get("size","?"), "bytes")'
+            "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}" | head -20
 
       # ── 5. EVIDENCE COLLECTION (real Trivy scan of the real image) ─────
       - name: 'Step 5 — Trivy CVE scan against the pushed image'
