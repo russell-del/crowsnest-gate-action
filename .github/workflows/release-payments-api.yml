@@ -147,7 +147,9 @@ jobs:
           # and the owner is <owner>.
           OWNER=$(echo "${{ env.IMAGE }}" | cut -d/ -f1)
           PKG_PATH=$(echo "${{ env.IMAGE }}" | cut -d/ -f2-)
-          ENCODED=$(python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ['P'], safe=''))" P="$PKG_PATH")
+          export PKG_PATH
+          ENCODED=$(python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ['PKG_PATH'], safe=''))")
+          echo "Fetching GHCR package: /users/$OWNER/packages/container/$ENCODED"
           gh api "/users/$OWNER/packages/container/$ENCODED" > /tmp/ghcr.json
           echo "GHCR package file: $(wc -c < /tmp/ghcr.json) bytes"
 
