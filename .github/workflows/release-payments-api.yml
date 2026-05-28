@@ -130,6 +130,27 @@ jobs:
               -o cyclonedx-json=/tmp/sbom.json
           echo "SBOM size: $(wc -c < /tmp/sbom.json) bytes"
 
+      # ── 5c. EVIDENCE COLLECTION — Artifact storage state ────────────────
+      - name: 'Step 5c — fetch storage state (manifest + GHCR package)'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The raw OCI manifest — tells us if attestations are attached
+          docker buildx imagetools inspect \
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }} \
+            --raw > /tmp/manifest.json
+          echo "Manifest size: $(wc -c < /tmp/manifest.json) bytes"
+
+          # The GHCR package metadata — tells us visibility, owner, version count
+          # The package name needs the path under the registry, URL-encoded.
+          # For ghcr.io/<owner>/<repo>/<image>, the package name is "<repo>/<image>"
+          # and the owner is <owner>.
+          OWNER=$(echo "${{ env.IMAGE }}" | cut -d/ -f1)
+          PKG_PATH=$(echo "${{ env.IMAGE }}" | cut -d/ -f2-)
+          ENCODED=$(python3 -c "import urllib.parse, os; print(urllib.parse.quote(os.environ['P'], safe=''))" P="$PKG_PATH")
+          gh api "/users/$OWNER/packages/container/$ENCODED" > /tmp/ghcr.json
+          echo "GHCR package file: $(wc -c < /tmp/ghcr.json) bytes"
+
       # ── 6a. PUSH CVE EVIDENCE TO CROWSNEST ──────────────────────────────
       - name: 'Step 6a — push CVE evidence to CrowsNest'
         id: push-cve
@@ -158,14 +179,32 @@ jobs:
           image-digest: ${{ steps.build.outputs.digest }}
           sbom-file:    /tmp/sbom.json
 
+      # ── 6c. PUSH STORAGE EVIDENCE TO CROWSNEST ──────────────────────────
+      - name: 'Step 6c — push artifact-storage evidence to CrowsNest'
+        id: push-storage
+        uses: ./actions/push-storage-evidence
+        with:
+          api-url:           ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:             ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:            ${{ inputs.app-id || 'app-ACME' }}
+          org-id:            '69e292d39fcbcce79bd877ad'
+          image:             ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          image-digest:      ${{ steps.build.outputs.digest }}
+          manifest-file:     /tmp/manifest.json
+          ghcr-package-file: /tmp/ghcr.json
+          registry:          ${{ env.REGISTRY }}
+
       - name: Push outputs
         run: |
-          echo "CVE  crowdata-id:      ${{ steps.push-cve.outputs.crowdata-id }}"
-          echo "  Critical CVEs:       ${{ steps.push-cve.outputs.critical-count }}"
-          echo "  High CVEs:           ${{ steps.push-cve.outputs.high-count }}"
-          echo "SBOM crowdata-id:      ${{ steps.push-sbom.outputs.crowdata-id }}"
-          echo "  Format:              ${{ steps.push-sbom.outputs.sbom-format }}"
-          echo "  Components:          ${{ steps.push-sbom.outputs.component-count }}"
+          echo "CVE     crowdata-id:        ${{ steps.push-cve.outputs.crowdata-id }}"
+          echo "  Critical CVEs:            ${{ steps.push-cve.outputs.critical-count }}"
+          echo "  High CVEs:                ${{ steps.push-cve.outputs.high-count }}"
+          echo "SBOM    crowdata-id:        ${{ steps.push-sbom.outputs.crowdata-id }}"
+          echo "  Format:                   ${{ steps.push-sbom.outputs.sbom-format }}"
+          echo "  Components:               ${{ steps.push-sbom.outputs.component-count }}"
+          echo "Storage crowdata-id:        ${{ steps.push-storage.outputs.crowdata-id }}"
+          echo "  Visibility:               ${{ steps.push-storage.outputs.visibility }}"
+          echo "  Attestations attached:    ${{ steps.push-storage.outputs.attestations-attached }}"
 
       # ── 7. THE GATE ────────────────────────────────────────────────────
       - name: 'Step 7 — CrowsNest release gate'

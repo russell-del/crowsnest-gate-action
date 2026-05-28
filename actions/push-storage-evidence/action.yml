@@ -1,0 +1,223 @@
+name: 'CrowsNest — push artifact-storage evidence'
+description: >
+  Reads (a) the raw OCI manifest produced by `docker buildx imagetools inspect --raw`
+  and (b) the GHCR package metadata produced by `gh api /users/.../packages/container/...`,
+  combines them into the CrowsNest build_artifact_storage crowdata shape, and POSTs
+  to /api/crowdata so the next gate evaluation can read it.
+author: 'CrowsNest'
+
+inputs:
+  api-url:
+    description: 'Base URL of the CrowsNest api-server'
+    required: true
+  token:
+    description: 'Bearer JWT with crowdata:write for the target app'
+    required: true
+  app-id:
+    description: 'CrowsNest application id (app-XXXX)'
+    required: true
+  image:
+    description: 'Image reference (e.g. ghcr.io/owner/repo/payments-api)'
+    required: true
+  image-digest:
+    description: 'Image content digest (sha256:...). Becomes the studiodata key.'
+    required: true
+  manifest-file:
+    description: 'Path to the raw OCI manifest JSON (output of `docker buildx imagetools inspect --raw`)'
+    required: true
+  ghcr-package-file:
+    description: 'Path to the GHCR package metadata JSON (output of `gh api /users/<owner>/packages/container/<encoded>`)'
+    required: true
+  registry:
+    description: 'Registry hostname (e.g. ghcr.io). Defaults to the host of the image ref.'
+    required: false
+    default: ''
+  crow-id:
+    description: 'CrowId attribution. Defaults to the standard storage-evidence source.'
+    required: false
+    default: '6a1b000000000000000000d0'
+  org-id:
+    description: 'CrowsNest orgId (required today due to api-server type-mismatch on missing orgId)'
+    required: false
+    default: ''
+  timeout-seconds:
+    description: 'HTTP timeout for the push'
+    required: false
+    default: '30'
+
+outputs:
+  crowdata-id:
+    description: 'MongoDB _id of the created crowdata document'
+    value: ${{ steps.push.outputs.crowdata-id }}
+  visibility:
+    description: 'Registry visibility (private | internal | public)'
+    value: ${{ steps.push.outputs.visibility }}
+  attestations-attached:
+    description: 'Whether provenance + SBOM attestations were detected (true|false)'
+    value: ${{ steps.push.outputs.attestations-attached }}
+
+runs:
+  using: composite
+  steps:
+    - id: push
+      shell: bash
+      env:
+        CN_API_URL:        ${{ inputs.api-url }}
+        CN_TOKEN:          ${{ inputs.token }}
+        CN_APP_ID:         ${{ inputs.app-id }}
+        CN_IMAGE:          ${{ inputs.image }}
+        CN_IMAGE_DIGEST:   ${{ inputs.image-digest }}
+        CN_MANIFEST_FILE:  ${{ inputs.manifest-file }}
+        CN_GHCR_FILE:      ${{ inputs.ghcr-package-file }}
+        CN_REGISTRY:       ${{ inputs.registry }}
+        CN_CROW_ID:        ${{ inputs.crow-id }}
+        CN_ORG_ID:         ${{ inputs.org-id }}
+        CN_TIMEOUT:        ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+
+        # ── 1. Validate ──────────────────────────────────────────────
+        if [[ ! -f "$CN_MANIFEST_FILE" ]]; then
+          echo "::error::Manifest file not found: $CN_MANIFEST_FILE"; exit 1
+        fi
+        if [[ ! -f "$CN_GHCR_FILE" ]]; then
+          echo "::error::GHCR package file not found: $CN_GHCR_FILE"; exit 1
+        fi
+        if [[ ! "$CN_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::image-digest must be sha256:<64-hex>, got: $CN_IMAGE_DIGEST"; exit 1
+        fi
+        if [[ ! "$CN_APP_ID" =~ ^app-[A-Za-z0-9]{4}$ ]]; then
+          echo "::error::app-id must be app-XXXX, got: $CN_APP_ID"; exit 1
+        fi
+
+        # ── 2. Transform → crowdata document ──────────────────────────
+        python3 - <<'PYEOF' > /tmp/cn-storage-crowdata.json
+        import json, os, datetime
+        manifest = json.load(open(os.environ["CN_MANIFEST_FILE"]))
+        ghcr     = json.load(open(os.environ["CN_GHCR_FILE"]))
+
+        image  = os.environ["CN_IMAGE"]
+        digest = os.environ["CN_IMAGE_DIGEST"]
+        # Registry: explicit input wins, else parse from the image ref
+        registry = os.environ.get("CN_REGISTRY") or image.split("/", 1)[0]
+        # The repository path after the registry, e.g. "russell-del/.../payments-api"
+        repository_name = image.split("/", 1)[1] if "/" in image else image
+
+        # Manifest analysis: detect if this is an OCI image index (multi-manifest, indicates
+        # attestations attached via buildx provenance: mode=max + sbom: true)
+        media_type = manifest.get("mediaType", "")
+        is_index = media_type in (
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+        )
+        manifests = manifest.get("manifests", []) if is_index else []
+        # Attestation manifests are those with an "in-toto" reference annotation
+        attestation_manifests = [
+            {
+                "mediaType": m.get("mediaType"),
+                "digest":    m.get("digest"),
+                "platform":  m.get("platform", {}),
+                "annotations": {
+                    k: v for k, v in (m.get("annotations") or {}).items()
+                    if "attestation" in k.lower() or "in-toto" in k.lower() or "reference.type" in k.lower()
+                },
+            }
+            for m in manifests
+            if any(
+                ("attestation" in k.lower() or "in-toto" in (v or "").lower() or v == "attestation-manifest")
+                for k, v in (m.get("annotations") or {}).items()
+            )
+        ]
+        attestations_attached = len(attestation_manifests) > 0
+
+        # Owner + visibility from GHCR
+        owner_login = (ghcr.get("owner") or {}).get("login", "unknown")
+        owner_type  = (ghcr.get("owner") or {}).get("type", "User")
+        visibility  = ghcr.get("visibility", "unknown")
+        version_count = ghcr.get("version_count", 0)
+        package_url = ghcr.get("html_url", "")
+
+        doc = {
+            "appId":  os.environ["CN_APP_ID"],
+            "crowId": os.environ["CN_CROW_ID"],
+            "data": {
+                "applications": {
+                    os.environ["CN_APP_ID"]: {
+                        "query_results": [{
+                            "result": {
+                                "data_type": "build_artifact_storage",
+                                "studiodata": {
+                                    digest: {
+                                        "image":                image,
+                                        "digest":               digest,
+                                        "registry":             registry,
+                                        "owner":                owner_login,
+                                        "ownerType":            owner_type,
+                                        "repositoryName":       repository_name,
+                                        "visibility":           visibility,
+                                        "versionCount":         version_count,
+                                        "packageUrl":           package_url,
+                                        "manifestType":         media_type,
+                                        "manifestCount":        len(manifests),
+                                        "attestationsAttached": attestations_attached,
+                                        "attestationManifests": attestation_manifests,
+                                        "fetchedAt":            datetime.datetime.now(datetime.UTC).isoformat(),
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        }
+        if os.environ.get("CN_ORG_ID"):
+            doc["orgId"] = os.environ["CN_ORG_ID"]
+        json.dump(doc, open("/tmp/cn-storage-crowdata.json","w"))
+        import sys
+        print(
+            f"::notice::Built storage crowdata: registry={registry}/{owner_login} "
+            f"visibility={visibility} attestations={attestations_attached} "
+            f"manifestType={media_type or 'unknown'}",
+            file=sys.stderr
+        )
+        PYEOF
+
+        # ── 3. POST to /api/crowdata ──────────────────────────────────
+        echo "::group::POST $CN_API_URL/api/crowdata"
+        HTTP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-storage-response.json \
+          --max-time "$CN_TIMEOUT" \
+          -X POST "$CN_API_URL/api/crowdata" \
+          -H "Authorization: Bearer $CN_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data-binary @/tmp/cn-storage-crowdata.json | tail -1)
+        echo "HTTP $HTTP"
+        cat /tmp/cn-storage-response.json
+        echo "::endgroup::"
+
+        if [[ "$HTTP" != "200" ]]; then
+          echo "::error::CrowsNest rejected the storage push (HTTP $HTTP)"
+          exit 1
+        fi
+
+        # ── 4. Emit outputs ──────────────────────────────────────────
+        CROWDATA_ID=$(python3 -c "import json; print(json.load(open('/tmp/cn-storage-response.json'))['_id'])")
+        VISIBILITY=$(python3 -c "import json; d=json.load(open('/tmp/cn-storage-crowdata.json')); print(list(d['data']['applications']['$CN_APP_ID']['query_results'][0]['result']['studiodata'].values())[0]['visibility'])")
+        ATTESTED=$(python3 -c "import json; d=json.load(open('/tmp/cn-storage-crowdata.json')); print(str(list(d['data']['applications']['$CN_APP_ID']['query_results'][0]['result']['studiodata'].values())[0]['attestationsAttached']).lower())")
+
+        echo "crowdata-id=$CROWDATA_ID"             >> "$GITHUB_OUTPUT"
+        echo "visibility=$VISIBILITY"               >> "$GITHUB_OUTPUT"
+        echo "attestations-attached=$ATTESTED"      >> "$GITHUB_OUTPUT"
+
+        # Markdown summary
+        {
+          echo "### CrowsNest Storage Evidence Pushed"
+          echo ""
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| App | \`$CN_APP_ID\` |"
+          echo "| Image | \`$CN_IMAGE\` |"
+          echo "| Digest | \`${CN_IMAGE_DIGEST:0:25}...\` |"
+          echo "| Visibility | **$VISIBILITY** |"
+          echo "| Attestations attached | $ATTESTED |"
+          echo "| CrowsNest document _id | \`$CROWDATA_ID\` |"
+        } >> "$GITHUB_STEP_SUMMARY"
