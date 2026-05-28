@@ -1,0 +1,210 @@
+name: 'CrowsNest — push SBOM evidence'
+description: >
+  Reads a CycloneDX or SPDX SBOM file produced by the workflow (Syft, BuildKit,
+  Trivy SBOM, etc.), transforms it into the CrowsNest build_sbom crowdata shape,
+  and POSTs it to /api/crowdata so the next gate evaluation can read it.
+author: 'CrowsNest'
+
+inputs:
+  api-url:
+    description: 'Base URL of the CrowsNest api-server'
+    required: true
+  token:
+    description: 'Bearer JWT (user or client) with crowdata:write for the target app'
+    required: true
+  app-id:
+    description: 'CrowsNest application id (app-XXXX)'
+    required: true
+  image:
+    description: 'Image reference, e.g. ghcr.io/customer/payments-api:1.42.0'
+    required: true
+  image-digest:
+    description: 'Image content digest (sha256:...). Becomes the studiodata key.'
+    required: true
+  sbom-file:
+    description: 'Path to the SBOM JSON file (CycloneDX or SPDX)'
+    required: true
+  sbom-format:
+    description: 'cyclonedx or spdx (default: autodetect from file)'
+    required: false
+    default: 'autodetect'
+  crow-id:
+    description: 'CrowId attribution. Defaults to the standard SBOM-evidence source id.'
+    required: false
+    default: '6a1b000000000000000000c8'
+  org-id:
+    description: 'CrowsNest orgId (required today due to api-server type-mismatch on missing orgId)'
+    required: false
+    default: ''
+  timeout-seconds:
+    description: 'HTTP timeout for the push'
+    required: false
+    default: '30'
+
+outputs:
+  crowdata-id:
+    description: 'MongoDB _id of the created crowdata document'
+    value: ${{ steps.push.outputs.crowdata-id }}
+  component-count:
+    description: 'Number of components found in the SBOM'
+    value: ${{ steps.push.outputs.component-count }}
+  sbom-format:
+    description: 'Detected SBOM format (cyclonedx or spdx)'
+    value: ${{ steps.push.outputs.sbom-format }}
+
+runs:
+  using: composite
+  steps:
+    - id: push
+      shell: bash
+      env:
+        CN_API_URL:      ${{ inputs.api-url }}
+        CN_TOKEN:        ${{ inputs.token }}
+        CN_APP_ID:       ${{ inputs.app-id }}
+        CN_IMAGE:        ${{ inputs.image }}
+        CN_IMAGE_DIGEST: ${{ inputs.image-digest }}
+        CN_SBOM_FILE:    ${{ inputs.sbom-file }}
+        CN_SBOM_FORMAT:  ${{ inputs.sbom-format }}
+        CN_CROW_ID:      ${{ inputs.crow-id }}
+        CN_ORG_ID:       ${{ inputs.org-id }}
+        CN_TIMEOUT:      ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+
+        # ── 1. Validate ──────────────────────────────────────────────
+        if [[ ! -f "$CN_SBOM_FILE" ]]; then
+          echo "::error::SBOM file not found: $CN_SBOM_FILE"; exit 1
+        fi
+        if [[ ! "$CN_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+          echo "::error::image-digest must be sha256:<64-hex>, got: $CN_IMAGE_DIGEST"; exit 1
+        fi
+        if [[ ! "$CN_APP_ID" =~ ^app-[A-Za-z0-9]{4}$ ]]; then
+          echo "::error::app-id must be app-XXXX, got: $CN_APP_ID"; exit 1
+        fi
+
+        # ── 2. Transform SBOM → crowdata document ────────────────────
+        python3 - <<'PYEOF' > /tmp/cn-sbom-crowdata.json
+        import json, os, datetime
+        sbom = json.load(open(os.environ["CN_SBOM_FILE"]))
+        digest   = os.environ["CN_IMAGE_DIGEST"]
+        image    = os.environ["CN_IMAGE"]
+        fmt_hint = os.environ.get("CN_SBOM_FORMAT","autodetect").lower()
+
+        # Detect format
+        if "bomFormat" in sbom and sbom["bomFormat"].lower() == "cyclonedx":
+            fmt = "cyclonedx"
+            spec_version = sbom.get("specVersion","unknown")
+            components = sbom.get("components", []) or []
+            metadata = sbom.get("metadata", {}) or {}
+            tools = metadata.get("tools", {}) or {}
+            if isinstance(tools, dict):
+                tool_list = tools.get("components", []) or []
+            else:
+                tool_list = tools
+            generator = (tool_list[0].get("name","unknown") if tool_list else "unknown")
+            gen_version = (tool_list[0].get("version","") if tool_list else "")
+            generated_at = metadata.get("timestamp", datetime.datetime.utcnow().isoformat()+"Z")
+        elif "spdxVersion" in sbom or sbom.get("SPDXID"):
+            fmt = "spdx"
+            spec_version = sbom.get("spdxVersion","unknown")
+            components = sbom.get("packages", []) or []
+            tools = sbom.get("creationInfo",{}).get("creators",[]) or []
+            generator = tools[0].split(":",1)[-1].strip() if tools else "unknown"
+            gen_version = ""
+            generated_at = sbom.get("creationInfo",{}).get("created", datetime.datetime.utcnow().isoformat()+"Z")
+        else:
+            print("::error::Unrecognized SBOM format (not CycloneDX or SPDX)")
+            raise SystemExit(1)
+
+        # Top 10 components for the evidence panel
+        top = []
+        for c in components[:10]:
+            if fmt == "cyclonedx":
+                top.append({
+                    "name":    c.get("name","?"),
+                    "version": c.get("version","?"),
+                    "type":    c.get("type","?"),
+                    "purl":    c.get("purl",""),
+                })
+            else:  # spdx
+                top.append({
+                    "name":    c.get("name","?"),
+                    "version": c.get("versionInfo","?"),
+                    "type":    "package",
+                    "purl":    "",
+                })
+
+        doc = {
+            "appId":  os.environ["CN_APP_ID"],
+            "crowId": os.environ["CN_CROW_ID"],
+            "data": {
+                "applications": {
+                    os.environ["CN_APP_ID"]: {
+                        "query_results": [{
+                            "result": {
+                                "data_type": "build_sbom",
+                                "studiodata": {
+                                    digest: {
+                                        "image":            image,
+                                        "digest":           digest,
+                                        "format":           fmt,
+                                        "specVersion":      spec_version,
+                                        "componentCount":   len(components),
+                                        "generator":        generator,
+                                        "generatorVersion": gen_version,
+                                        "generatedAt":      generated_at,
+                                        "topComponents":    top,
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        }
+        if os.environ.get("CN_ORG_ID"):
+            doc["orgId"] = os.environ["CN_ORG_ID"]
+        json.dump(doc, open("/tmp/cn-sbom-crowdata.json","w"))
+        import sys
+        print(f"::notice::Built SBOM crowdata: image={image} digest={digest[:25]}... format={fmt} components={len(components)}", file=sys.stderr)
+        PYEOF
+
+        # ── 3. POST to /api/crowdata ──────────────────────────────────
+        echo "::group::POST $CN_API_URL/api/crowdata"
+        HTTP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-sbom-response.json \
+          --max-time "$CN_TIMEOUT" \
+          -X POST "$CN_API_URL/api/crowdata" \
+          -H "Authorization: Bearer $CN_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data-binary @/tmp/cn-sbom-crowdata.json | tail -1)
+        echo "HTTP $HTTP"
+        cat /tmp/cn-sbom-response.json
+        echo "::endgroup::"
+
+        if [[ "$HTTP" != "200" ]]; then
+          echo "::error::CrowsNest rejected the SBOM push (HTTP $HTTP)"
+          exit 1
+        fi
+
+        # ── 4. Emit outputs ──────────────────────────────────────────
+        CROWDATA_ID=$(python3 -c "import json; print(json.load(open('/tmp/cn-sbom-response.json'))['_id'])")
+        COMPONENT_COUNT=$(python3 -c "import json; d=json.load(open('/tmp/cn-sbom-crowdata.json')); print(list(d['data']['applications']['$CN_APP_ID']['query_results'][0]['result']['studiodata'].values())[0]['componentCount'])")
+        SBOM_FMT=$(python3 -c "import json; d=json.load(open('/tmp/cn-sbom-crowdata.json')); print(list(d['data']['applications']['$CN_APP_ID']['query_results'][0]['result']['studiodata'].values())[0]['format'])")
+
+        echo "crowdata-id=$CROWDATA_ID"       >> "$GITHUB_OUTPUT"
+        echo "component-count=$COMPONENT_COUNT" >> "$GITHUB_OUTPUT"
+        echo "sbom-format=$SBOM_FMT"           >> "$GITHUB_OUTPUT"
+
+        # Markdown summary
+        {
+          echo "### CrowsNest SBOM Evidence Pushed"
+          echo ""
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| App | \`$CN_APP_ID\` |"
+          echo "| Image | \`$CN_IMAGE\` |"
+          echo "| Digest | \`${CN_IMAGE_DIGEST:0:25}...\` |"
+          echo "| Format | $SBOM_FMT |"
+          echo "| Components | **$COMPONENT_COUNT** |"
+          echo "| CrowsNest document _id | \`$CROWDATA_ID\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -103,8 +103,8 @@ jobs:
           docker buildx imagetools inspect \
             "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}" | head -20
 
-      # ── 5. EVIDENCE COLLECTION (real Trivy scan of the real image) ─────
-      - name: 'Step 5 — Trivy CVE scan against the pushed image'
+      # ── 5a. EVIDENCE COLLECTION — Trivy CVE scan ────────────────────────
+      - name: 'Step 5a — Trivy CVE scan against the pushed image'
         run: |
           # Pull image creds from the host docker login (above) into Trivy by sharing the socket.
           docker run --rm \
@@ -118,8 +118,20 @@ jobs:
               ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           echo "Trivy report size: $(wc -c < /tmp/trivy.json) bytes"
 
-      # ── 6. PUSH EVIDENCE TO CROWSNEST ──────────────────────────────────
-      - name: 'Step 6 — push CVE evidence to CrowsNest'
+      # ── 5b. EVIDENCE COLLECTION — Syft SBOM generation ──────────────────
+      - name: 'Step 5b — Syft SBOM generation (CycloneDX)'
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $HOME/.docker/config.json:/root/.docker/config.json:ro \
+            -v /tmp:/tmp \
+            anchore/syft:latest \
+              ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }} \
+              -o cyclonedx-json=/tmp/sbom.json
+          echo "SBOM size: $(wc -c < /tmp/sbom.json) bytes"
+
+      # ── 6a. PUSH CVE EVIDENCE TO CROWSNEST ──────────────────────────────
+      - name: 'Step 6a — push CVE evidence to CrowsNest'
         id: push-cve
         uses: ./actions/push-cve-evidence
         with:
@@ -133,11 +145,27 @@ jobs:
           image-digest: ${{ steps.build.outputs.digest }}
           trivy-file:   /tmp/trivy.json
 
+      # ── 6b. PUSH SBOM EVIDENCE TO CROWSNEST ─────────────────────────────
+      - name: 'Step 6b — push SBOM evidence to CrowsNest'
+        id: push-sbom
+        uses: ./actions/push-sbom-evidence
+        with:
+          api-url:      ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:        ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:       ${{ inputs.app-id || 'app-ACME' }}
+          org-id:       '69e292d39fcbcce79bd877ad'
+          image:        ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          image-digest: ${{ steps.build.outputs.digest }}
+          sbom-file:    /tmp/sbom.json
+
       - name: Push outputs
         run: |
-          echo "CrowsNest crowdata-id: ${{ steps.push-cve.outputs.crowdata-id }}"
-          echo "Critical CVEs found:   ${{ steps.push-cve.outputs.critical-count }}"
-          echo "High CVEs found:       ${{ steps.push-cve.outputs.high-count }}"
+          echo "CVE  crowdata-id:      ${{ steps.push-cve.outputs.crowdata-id }}"
+          echo "  Critical CVEs:       ${{ steps.push-cve.outputs.critical-count }}"
+          echo "  High CVEs:           ${{ steps.push-cve.outputs.high-count }}"
+          echo "SBOM crowdata-id:      ${{ steps.push-sbom.outputs.crowdata-id }}"
+          echo "  Format:              ${{ steps.push-sbom.outputs.sbom-format }}"
+          echo "  Components:          ${{ steps.push-sbom.outputs.component-count }}"
 
       # ── 7. THE GATE ────────────────────────────────────────────────────
       - name: 'Step 7 — CrowsNest release gate'
