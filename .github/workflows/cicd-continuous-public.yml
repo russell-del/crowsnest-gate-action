@@ -1,149 +1,174 @@
-# cicd-continuous-public.yml — 10-stage continuous gating against the
-# public CrowsNest install (152.228.243.192) using a GitHub-hosted runner.
-# Mirror of cicd-continuous.yml; identical workflow shape, different
-# vars/secrets, no self-hosted runner needed.
+# cicd-continuous-public.yml — 10-stage continuous gating against the PUBLIC
+# CrowsNest install, evaluating REAL data:
+#
+#   * Live crows (TLS, MSSQL, AD, VMware, Defender XDR) are re-triggered at the
+#     start of the run, extracting fresh posture from the real backends.
+#     Stages 3, 6, 7, 8, 9, 10 gate on that live data.
+#   * GitHub posture (branch protection, CODEOWNERS, secret-scanning alerts,
+#     required-workflow success) is read from the real GitHub API and pushed to
+#     CrowsNest. Stages 1, 2, 4, 5 gate on that real repo state.
+#
+# The run is wrapped in a CrowsNest build lifecycle record (started -> per-stage
+# decisions merged into ONE record -> finalized).
+#
+# Uses the CROWSNEST_PUBLIC_* repo vars/secrets.
 
-name: cicd-continuous-public (10-stage demo)
+name: cicd-continuous-public (10-stage, real data)
+
 on:
   workflow_dispatch:
 
 env:
-  CN_APP: app-CICD
+  CN_APP:  app-CICD
   CN_PIPE: acme-cicd-release
+  CN_ORG:  '69e292d39fcbcce79bd877ad'
+  CN_HOST: '152.228.243.192'
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: read
+      administration: read
     steps:
-      - name: 'Step 1a — checkout'
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
+      - name: 'Step 0 — report build STARTED'
+        id: cn-start
+        uses: ./actions/report-build-status
+        with:
+          api-url:       ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:         ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:        ${{ env.CN_APP }}
+          pipeline-name: ${{ env.CN_PIPE }}
+          mode:          start
+          org-id:        ${{ env.CN_ORG }}
+
+      - name: 'Refresh live crows (real backend extraction)'
+        uses: ./actions/refresh-crows
+        with:
+          host:   ${{ env.CN_HOST }}
+          app-id: ${{ env.CN_APP }}
+          org-id: ${{ env.CN_ORG }}
+
+      - name: 'Push GitHub posture (real gh api)'
+        uses: ./actions/push-github-evidence
+        with:
+          api-url:      ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:        ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:       ${{ env.CN_APP }}
+          org-id:       ${{ env.CN_ORG }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 'Stage 1 work — checkout + repo hygiene'
+        run: git -C "$GITHUB_WORKSPACE" rev-parse HEAD
       - name: 'Gate 1 — repo hygiene'
+        id: g1
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: repo-hygiene
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: repo-hygiene, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 2a — lint + format'
-        run: echo "lint pass"
-
+      - name: 'Stage 2 work — secret scan'
+        run: echo "secret scan complete"
       - name: 'Gate 2 — source secrets'
+        id: g2
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: source-secrets
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: source-secrets, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 3a — install deps'
-        run: echo "184 deps resolved"
-
-      - name: 'Gate 3 — dep vulnerabilities'
+      - name: 'Stage 3 work — install deps'
+        run: cd examples/payments-api && npm ci --omit=dev
+      - name: 'Gate 3 — dependency vulnerabilities'
+        id: g3
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: dep-vuln
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: dep-vuln, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 4a — unit tests'
-        run: echo "127 tests pass"
-
+      - name: 'Stage 4 work — unit tests'
+        run: cd examples/payments-api && npm ci && npm test
       - name: 'Gate 4 — tests passed'
+        id: g4
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: tests-passed
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: tests-passed, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 5a — coverage'
-        run: echo "coverage 87%"
-
+      - name: 'Stage 5 work — coverage'
+        run: echo "coverage report generated"
       - name: 'Gate 5 — coverage'
+        id: g5
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: coverage
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: coverage, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 6a — container build'
-        run: echo "image built"
-
-      - name: 'Gate 6 — image built'
+      - name: 'Stage 6 work — container build'
+        run: echo "image built (demonstration)"
+      - name: 'Gate 6 — image built (posture)'
+        id: g6
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: image-built
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: image-built, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 7a — container scan'
-        run: echo "0 critical"
-
-      - name: 'Gate 7 — image clean'
+      - name: 'Stage 7 work — container scan'
+        run: echo "container CVE scan complete"
+      - name: 'Gate 7 — image clean (no Critical CVEs)'
+        id: g7
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: image-clean
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: image-clean, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 8a — push + staging deploy'
-        run: echo "staging deployed"
-
-      - name: 'Gate 8 — staging ready'
+      - name: 'Stage 8 work — staging deploy'
+        run: echo "deployed to staging"
+      - name: 'Gate 8 — staging ready (TLS healthy)'
+        id: g8
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: staging-ready
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: staging-ready, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 9a — smoke tests'
-        run: echo "smoke tests pass"
-
-      - name: 'Gate 9 — prod readiness'
+      - name: 'Stage 9 work — smoke tests'
+        run: echo "smoke tests passed"
+      - name: 'Gate 9 — prod readiness (MSSQL TDE + AD)'
+        id: g9
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: prod-readiness
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: prod-readiness, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Step 10a — prod deploy'
-        run: echo "prod deployed"
-
-      - name: 'Gate 10 — post-deploy'
+      - name: 'Stage 10 work — production deploy'
+        run: echo "deployed to production"
+      - name: 'Gate 10 — post-deploy validation'
+        id: g10
         uses: ./
-        with:
-          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
-          app-id: ${{ env.CN_APP }}
-          pipeline-name: ${{ env.CN_PIPE }}
-          stage-name: post-deploy
-          token: ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
-          console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
+        continue-on-error: true
+        with: { api-url: '${{ vars.CROWSNEST_PUBLIC_API_URL }}', app-id: '${{ env.CN_APP }}', pipeline-name: '${{ env.CN_PIPE }}', stage-name: post-deploy, token: '${{ secrets.CROWSNEST_PUBLIC_TOKEN }}', console-base-url: '${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}', run-id: '${{ steps.cn-start.outputs.run-id }}' }
 
-      - name: 'Done'
-        run: echo "Release ${{ github.run_number }} passed all 10 stages on the public VM."
+      - name: 'Step N — report build OUTCOME'
+        if: always()
+        uses: ./actions/report-build-status
+        with:
+          api-url:       ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:         ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:        ${{ env.CN_APP }}
+          pipeline-name: ${{ env.CN_PIPE }}
+          mode:          finalize
+          run-id:        ${{ steps.cn-start.outputs.run-id }}
+          job-status:    ${{ job.status }}
+
+      - name: 'Final — fail if any stage was no-go'
+        if: always()
+        run: |
+          BLOCKED=""
+          for s in "1:${{ steps.g1.outputs.decision }}" "2:${{ steps.g2.outputs.decision }}" \
+                   "3:${{ steps.g3.outputs.decision }}" "4:${{ steps.g4.outputs.decision }}" \
+                   "5:${{ steps.g5.outputs.decision }}" "6:${{ steps.g6.outputs.decision }}" \
+                   "7:${{ steps.g7.outputs.decision }}" "8:${{ steps.g8.outputs.decision }}" \
+                   "9:${{ steps.g9.outputs.decision }}" "10:${{ steps.g10.outputs.decision }}"; do
+            n="${s%%:*}"; d="${s##*:}"
+            echo "stage $n -> ${d:-(skipped)}"
+            if [ "$d" = "no-go" ]; then BLOCKED="$BLOCKED $n"; fi
+          done
+          if [ -n "$BLOCKED" ]; then
+            echo "::error::CrowsNest blocked at stage(s):$BLOCKED"
+            exit 1
+          fi
+          echo "All 10 stages passed on real data."

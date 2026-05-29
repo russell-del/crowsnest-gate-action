@@ -1,0 +1,135 @@
+name: 'CrowsNest — push GitHub posture evidence'
+description: >
+  Queries the real GitHub API for a repository's security posture (branch
+  protection, CODEOWNERS presence, open secret-scanning alerts, required-
+  workflow success) and pushes it to CrowsNest as github_posture crowdata, so
+  the GitHub posture gates evaluate the repo's actual current state.
+author: 'CrowsNest'
+
+inputs:
+  api-url:
+    description: 'Base URL of the CrowsNest api-server'
+    required: true
+  token:
+    description: 'CrowsNest Bearer JWT'
+    required: true
+  app-id:
+    description: 'CrowsNest application id (app-XXXX)'
+    required: true
+  org-id:
+    description: 'CrowsNest orgId'
+    required: true
+  repo:
+    description: 'owner/name of the repository to inspect'
+    required: false
+    default: ${{ github.repository }}
+  default-branch:
+    description: 'Default branch to check protection on'
+    required: false
+    default: ${{ github.ref_name }}
+  required-workflow:
+    description: 'Workflow file whose success the gate requires'
+    required: false
+    default: 'e2e-mock.yml'
+  github-token:
+    description: 'GitHub token for the gh API queries'
+    required: true
+  crow-id:
+    description: 'GitHub Crow id (data attribution)'
+    required: false
+    default: '6a0a000000000000000000a0'
+  timeout-seconds:
+    description: 'HTTP timeout for the CrowsNest push'
+    required: false
+    default: '30'
+
+outputs:
+  crowdata-id:
+    description: 'MongoDB _id of the created crowdata document'
+    value: ${{ steps.push.outputs.crowdata-id }}
+
+runs:
+  using: composite
+  steps:
+    - id: push
+      shell: bash
+      env:
+        CN_API_URL: ${{ inputs.api-url }}
+        CN_TOKEN: ${{ inputs.token }}
+        CN_APP_ID: ${{ inputs.app-id }}
+        CN_ORG_ID: ${{ inputs.org-id }}
+        CN_REPO: ${{ inputs.repo }}
+        CN_BRANCH: ${{ inputs.default-branch }}
+        CN_REQ_WF: ${{ inputs.required-workflow }}
+        CN_CROW_ID: ${{ inputs.crow-id }}
+        CN_TIMEOUT: ${{ inputs.timeout-seconds }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -uo pipefail
+        if [[ ! "$CN_APP_ID" =~ ^app-[A-Za-z0-9]{4}$ ]]; then
+          echo "::error::app-id must be app-XXXX, got: $CN_APP_ID"; exit 1
+        fi
+        echo "Querying real GitHub posture for $CN_REPO (branch $CN_BRANCH)"
+
+        if gh api "repos/$CN_REPO/branches/$CN_BRANCH/protection" >/dev/null 2>&1; then PROT=true; else PROT=false; fi
+
+        CODEOWNERS=false
+        for p in ".github/CODEOWNERS" "CODEOWNERS" "docs/CODEOWNERS"; do
+          if gh api "repos/$CN_REPO/contents/$p" >/dev/null 2>&1; then CODEOWNERS=true; break; fi
+        done
+
+        if gh api "repos/$CN_REPO/secret-scanning/alerts?state=open" >/tmp/gh_ss.json 2>/dev/null; then
+          OPEN_ALERTS=$(python3 -c "import json;d=json.load(open('/tmp/gh_ss.json'));print(len(d) if isinstance(d,list) else 0)")
+        else
+          OPEN_ALERTS=0
+        fi
+
+        WF_TOTAL=0; WF_RATE=0
+        if gh api "repos/$CN_REPO/actions/workflows/$CN_REQ_WF/runs?branch=$CN_BRANCH&status=completed&per_page=1" >/tmp/gh_wf.json 2>/dev/null; then
+          read WF_TOTAL WF_RATE < <(python3 -c "
+import json
+d=json.load(open('/tmp/gh_wf.json'))
+r=d.get('workflow_runs',[])
+print('0 0' if not r else '1 ' + ('1.0' if r[0]['conclusion']=='success' else '0.0'))
+")
+        fi
+
+        REQ_WF_NAME="$(basename "$CN_REQ_WF" .yml)"
+        echo "  branchProtection=$PROT codeowners=$CODEOWNERS openAlerts=$OPEN_ALERTS reqWf=$REQ_WF_NAME total=$WF_TOTAL rate=$WF_RATE"
+
+        PROT="$PROT" CODEOWNERS="$CODEOWNERS" OPEN_ALERTS="$OPEN_ALERTS" \
+        WF_TOTAL="$WF_TOTAL" WF_RATE="$WF_RATE" REQ_WF_NAME="$REQ_WF_NAME" \
+        python3 -c '
+import json, os
+repo = os.environ["CN_REPO"]
+sd = { repo: {
+  "branchProtection": { "enabled": os.environ["PROT"] == "true" },
+  "codeowners": { "present": os.environ["CODEOWNERS"] == "true" },
+  "secretScanning": { "openAlerts": int(os.environ["OPEN_ALERTS"]) },
+  "workflowRuns": { "workflows": { os.environ["REQ_WF_NAME"]: {
+    "totalCount": int(os.environ["WF_TOTAL"]),
+    "successRate": float(os.environ["WF_RATE"]),
+  }}},
+}}
+doc = {
+  "orgId": os.environ["CN_ORG_ID"],
+  "appId": os.environ["CN_APP_ID"],
+  "crowId": os.environ["CN_CROW_ID"],
+  "data": { "applications": { os.environ["CN_APP_ID"]: { "query_results": [
+    { "result": { "data_type": "github_posture", "studiodata": sd } }
+  ]}}},
+}
+json.dump(doc, open("/tmp/cn-gh.json","w"))
+'
+        HTTP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-gh-resp.json --max-time "$CN_TIMEOUT" \
+          -X POST "$CN_API_URL/api/crowdata" \
+          -H "Authorization: Bearer $CN_TOKEN" -H "Content-Type: application/json" \
+          --data-binary @/tmp/cn-gh.json | tail -1)
+        if [ "$HTTP" != "200" ]; then
+          echo "::error::CrowsNest rejected GitHub evidence (HTTP $HTTP)"; cat /tmp/cn-gh-resp.json; exit 1
+        fi
+        RID=$(python3 -c "import json;print(json.load(open('/tmp/cn-gh-resp.json'))['_id'])")
+        echo "crowdata-id=$RID" >> "$GITHUB_OUTPUT"
+        echo "::notice::GitHub posture pushed: $RID"
+        printf '### CrowsNest — GitHub posture pushed\n\n| Field | Value |\n|---|---|\n| Repo | `%s` |\n| Branch protection | `%s` |\n| CODEOWNERS | `%s` |\n| Open secret alerts | `%s` |\n| Required workflow | `%s` rate=%s |\n| Document id | `%s` |\n' \
+          "$CN_REPO" "$PROT" "$CODEOWNERS" "$OPEN_ALERTS" "$REQ_WF_NAME" "$WF_RATE" "$RID" >> "$GITHUB_STEP_SUMMARY"

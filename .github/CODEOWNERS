@@ -1,0 +1,3 @@
+# CODEOWNERS — default review ownership for crowsnest-gate-action.
+# Required by the CrowsNest "GitHub: CODEOWNERS file present" posture check.
+* @russell-del
