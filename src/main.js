@@ -73,6 +73,7 @@ async function run() {
     const appId = core.getInput('app-id', { required: true });
     const pipelineName = core.getInput('pipeline-name', { required: true });
     const stageName = core.getInput('stage-name') || '';
+    const runId = core.getInput('run-id') || '';
     const token = core.getInput('token', { required: true });
     const consoleBaseInput = core.getInput('console-base-url');
     const warnAsFailure = core.getInput('warn-as-failure').toLowerCase() === 'true';
@@ -96,7 +97,7 @@ async function run() {
           'Authorization': `Bearer ${token}`,
           'User-Agent': 'crowsnest-gate-action',
         },
-        body: '{}',
+        body: JSON.stringify(runId ? { runId } : {}),
         signal: controller.signal,
       });
     } finally {

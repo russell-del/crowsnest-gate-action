@@ -3,15 +3,19 @@
 # release.yml would look like; in their repo the service lives at the
 # repo root, not under examples/.
 #
-# What it actually does on each run:
+# Full lifecycle:
+#   0. Open a CrowsNest build record (status=started) — so even a failure
+#      below is recorded, not silence.
 #   1. Install deps (npm ci against the committed lock file)
 #   2. Run the test suite (real assertions against a running HTTP server)
-#   3. Build a real container image with buildx (provenance + SBOM attestation)
-#   4. Push the image to GHCR (private package by default)
-#   5. Trivy CVE scan against the just-pushed image
-#   6. Push the scan result to CrowsNest as build_cve_scan crowdata
-#   7. Run the CrowsNest gate against that fresh evidence
-#   8. Deploy step gated on the result
+#   3. Build + push a real container image (provenance + SBOM attestation)
+#   4. Confirm the pushed image
+#   5. Collect evidence: Trivy CVE scan, Syft SBOM, storage state
+#   6. Push CVE / SBOM / storage evidence to CrowsNest
+#   7. Run the CrowsNest gate (attached to the run from step 0)
+#   8. Deploy — only on go/warn
+#   9. Finalize the build record — ALWAYS (maps job.status → passed/failed)
+#  10. Re-assert a no-go so the GHA run reflects the block
 #
 # Targets the PUBLIC CrowsNest install (152.228.243.192) — uses the
 # CROWSNEST_PUBLIC_* vars/secrets.
@@ -36,7 +40,7 @@ on:
 
 env:
   REGISTRY:  ghcr.io
-  # Image name. github.repository lower-cases to <owner>/<repo>; we append /payments-api.
+  # github.repository lower-cases to <owner>/<repo>; we append /payments-api.
   IMAGE:     ${{ github.repository }}/payments-api
 
 jobs:
@@ -44,9 +48,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents:     read
-      packages:     write       # push to GHCR
-      id-token:     write       # for cosign keyless signing
-      attestations: write       # for SBOM attestation
+      packages:     write
+      id-token:     write
+      attestations: write
     defaults:
       run:
         working-directory: examples/payments-api
@@ -54,7 +58,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ── 1. BUILD STEPS (real) ──────────────────────────────────────────
+      # ── 0. OPEN the build record in CrowsNest (status=started) ──────────
+      - name: 'Step 0 — report build STARTED to CrowsNest'
+        id: cn-start
+        uses: ./actions/report-build-status
+        with:
+          api-url:       ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:         ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:        ${{ inputs.app-id || 'app-ACME' }}
+          pipeline-name: ${{ inputs.pipeline-name || 'acme-build-evidence' }}
+          mode:          start
+          org-id:        '69e292d39fcbcce79bd877ad'
+
+      # ── 1. INSTALL ─────────────────────────────────────────────────────
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -64,9 +80,11 @@ jobs:
       - name: 'Step 1 — install dependencies'
         run: npm ci
 
+      # ── 2. TEST ────────────────────────────────────────────────────────
       - name: 'Step 2 — run tests'
         run: npm test
 
+      # ── 3. BUILD + PUSH IMAGE ──────────────────────────────────────────
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -85,28 +103,23 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest
-          # provenance + sbom are real attestations attached to the image
           provenance: mode=max
           sbom:       true
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.created=${{ github.event.repository.updated_at }}
 
+      # ── 4. CONFIRM PUSHED IMAGE ────────────────────────────────────────
       - name: 'Step 4 — confirm pushed image'
         run: |
           DIGEST="${{ steps.build.outputs.digest }}"
           echo "image:  ${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
-          # Show first 20 lines of the manifest. With provenance: mode=max the manifest
-          # is an OCI image index containing the image + provenance + SBOM attestations
-          # — printing it confirms we can resolve and pull the digest end-to-end.
           docker buildx imagetools inspect \
             "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}" | head -20
 
-      # ── 5a. EVIDENCE COLLECTION — Trivy CVE scan ────────────────────────
+      # ── 5a. EVIDENCE — Trivy CVE scan ──────────────────────────────────
       - name: 'Step 5a — Trivy CVE scan against the pushed image'
         run: |
-          # Pull image creds from the host docker login (above) into Trivy by sharing the socket.
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v $HOME/.docker/config.json:/root/.docker/config.json:ro \
@@ -118,7 +131,7 @@ jobs:
               ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           echo "Trivy report size: $(wc -c < /tmp/trivy.json) bytes"
 
-      # ── 5b. EVIDENCE COLLECTION — Syft SBOM generation ──────────────────
+      # ── 5b. EVIDENCE — Syft SBOM ───────────────────────────────────────
       - name: 'Step 5b — Syft SBOM generation (CycloneDX)'
         run: |
           docker run --rm \
@@ -130,21 +143,15 @@ jobs:
               -o cyclonedx-json=/tmp/sbom.json
           echo "SBOM size: $(wc -c < /tmp/sbom.json) bytes"
 
-      # ── 5c. EVIDENCE COLLECTION — Artifact storage state ────────────────
+      # ── 5c. EVIDENCE — artifact storage state ──────────────────────────
       - name: 'Step 5c — fetch storage state (manifest + GHCR package)'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # The raw OCI manifest — tells us if attestations are attached
           docker buildx imagetools inspect \
             ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }} \
             --raw > /tmp/manifest.json
           echo "Manifest size: $(wc -c < /tmp/manifest.json) bytes"
-
-          # The GHCR package metadata — tells us visibility, owner, version count
-          # The package name needs the path under the registry, URL-encoded.
-          # For ghcr.io/<owner>/<repo>/<image>, the package name is "<repo>/<image>"
-          # and the owner is <owner>.
           OWNER=$(echo "${{ env.IMAGE }}" | cut -d/ -f1)
           PKG_PATH=$(echo "${{ env.IMAGE }}" | cut -d/ -f2-)
           export PKG_PATH
@@ -153,7 +160,7 @@ jobs:
           gh api "/users/$OWNER/packages/container/$ENCODED" > /tmp/ghcr.json
           echo "GHCR package file: $(wc -c < /tmp/ghcr.json) bytes"
 
-      # ── 6a. PUSH CVE EVIDENCE TO CROWSNEST ──────────────────────────────
+      # ── 6a. PUSH CVE EVIDENCE ──────────────────────────────────────────
       - name: 'Step 6a — push CVE evidence to CrowsNest'
         id: push-cve
         uses: ./actions/push-cve-evidence
@@ -161,14 +168,12 @@ jobs:
           api-url:      ${{ vars.CROWSNEST_PUBLIC_API_URL }}
           token:        ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
           app-id:       ${{ inputs.app-id || 'app-ACME' }}
-          # Required because the api-server's check compares req.user.orgId (ObjectId)
-          # against the body's orgId (string); omitting it triggers a type-mismatch 403.
           org-id:       '69e292d39fcbcce79bd877ad'
           image:        ${{ env.REGISTRY }}/${{ env.IMAGE }}
           image-digest: ${{ steps.build.outputs.digest }}
           trivy-file:   /tmp/trivy.json
 
-      # ── 6b. PUSH SBOM EVIDENCE TO CROWSNEST ─────────────────────────────
+      # ── 6b. PUSH SBOM EVIDENCE ─────────────────────────────────────────
       - name: 'Step 6b — push SBOM evidence to CrowsNest'
         id: push-sbom
         uses: ./actions/push-sbom-evidence
@@ -181,7 +186,7 @@ jobs:
           image-digest: ${{ steps.build.outputs.digest }}
           sbom-file:    /tmp/sbom.json
 
-      # ── 6c. PUSH STORAGE EVIDENCE TO CROWSNEST ──────────────────────────
+      # ── 6c. PUSH STORAGE EVIDENCE ──────────────────────────────────────
       - name: 'Step 6c — push artifact-storage evidence to CrowsNest'
         id: push-storage
         uses: ./actions/push-storage-evidence
@@ -196,40 +201,65 @@ jobs:
           ghcr-package-file: /tmp/ghcr.json
           registry:          ${{ env.REGISTRY }}
 
-      - name: Push outputs
+      - name: 'Push outputs'
         run: |
-          echo "CVE     crowdata-id:        ${{ steps.push-cve.outputs.crowdata-id }}"
-          echo "  Critical CVEs:            ${{ steps.push-cve.outputs.critical-count }}"
-          echo "  High CVEs:                ${{ steps.push-cve.outputs.high-count }}"
-          echo "SBOM    crowdata-id:        ${{ steps.push-sbom.outputs.crowdata-id }}"
-          echo "  Format:                   ${{ steps.push-sbom.outputs.sbom-format }}"
-          echo "  Components:               ${{ steps.push-sbom.outputs.component-count }}"
-          echo "Storage crowdata-id:        ${{ steps.push-storage.outputs.crowdata-id }}"
-          echo "  Visibility:               ${{ steps.push-storage.outputs.visibility }}"
-          echo "  Attestations attached:    ${{ steps.push-storage.outputs.attestations-attached }}"
+          echo "CVE     crowdata-id:     ${{ steps.push-cve.outputs.crowdata-id }}"
+          echo "  Critical CVEs:         ${{ steps.push-cve.outputs.critical-count }}"
+          echo "  High CVEs:             ${{ steps.push-cve.outputs.high-count }}"
+          echo "SBOM    crowdata-id:     ${{ steps.push-sbom.outputs.crowdata-id }}"
+          echo "  Format:                ${{ steps.push-sbom.outputs.sbom-format }}"
+          echo "  Components:            ${{ steps.push-sbom.outputs.component-count }}"
+          echo "Storage crowdata-id:     ${{ steps.push-storage.outputs.crowdata-id }}"
+          echo "  Visibility:            ${{ steps.push-storage.outputs.visibility }}"
+          echo "  Attestations attached: ${{ steps.push-storage.outputs.attestations-attached }}"
 
       # ── 7. THE GATE ────────────────────────────────────────────────────
+      # continue-on-error so a no-go does NOT abort the job before Step 9 can
+      # finalize the build record. Step 10 re-asserts the failure afterward.
       - name: 'Step 7 — CrowsNest release gate'
         id: gate
         uses: ./
+        continue-on-error: true
         with:
           api-url:          ${{ vars.CROWSNEST_PUBLIC_API_URL }}
           app-id:           ${{ inputs.app-id || 'app-ACME' }}
           pipeline-name:    ${{ inputs.pipeline-name || 'acme-build-evidence' }}
           token:            ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
           console-base-url: ${{ vars.CROWSNEST_PUBLIC_CONSOLE_URL }}
-        # Important: do NOT continue-on-error here in production —
-        # a no-go MUST block the deploy step below.
+          # Attach the gate result to the lifecycle run opened in Step 0 so it's
+          # ONE record (started → gate decision → finalized), not a duplicate.
+          run-id:           ${{ steps.cn-start.outputs.run-id }}
 
-      # ── 8. DEPLOY (gated by step 7) ────────────────────────────────────
+      # ── 8. DEPLOY (only on go/warn) ────────────────────────────────────
       - name: 'Step 8 — deploy to production'
+        if: steps.gate.outputs.decision == 'go' || steps.gate.outputs.decision == 'warn'
         run: |
           echo "✓ Gate passed (${{ steps.gate.outputs.decision }})."
-          echo ""
           echo "  Image:      ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
           echo "  Run record: ${{ steps.gate.outputs.run-url }}"
           echo ""
           echo "In a real workflow this step would run:"
-          echo "    kubectl apply -n prod -f deployment.yaml"
-          echo "    kubectl set image deployment/payments-api"
-          echo "      payments-api=${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+          echo "    kubectl set image deployment/payments-api payments-api=${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }}"
+
+      # ── 9. FINALIZE the build record — ALWAYS ──────────────────────────
+      # job.status is success|failure|cancelled here; the action maps it to the
+      # run's terminal lifecycle status. Guarantees a build that broke at
+      # compile/test/scan still shows as failed in CrowsNest.
+      - name: 'Step 9 — report build OUTCOME to CrowsNest'
+        if: always()
+        uses: ./actions/report-build-status
+        with:
+          api-url:       ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:         ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:        ${{ inputs.app-id || 'app-ACME' }}
+          pipeline-name: ${{ inputs.pipeline-name || 'acme-build-evidence' }}
+          mode:          finalize
+          run-id:        ${{ steps.cn-start.outputs.run-id }}
+          job-status:    ${{ job.status }}
+
+      # ── 10. Re-assert a no-go so the GHA run reflects the block ─────────
+      - name: 'Step 10 — fail the job if the gate blocked'
+        if: always() && steps.gate.outputs.decision == 'no-go'
+        run: |
+          echo "::error::CrowsNest gate decision was NO-GO — failing the build."
+          exit 1
