@@ -1,10 +1,10 @@
 name: 'CrowsNest — report build status'
 description: >
-  Records a build's lifecycle in CrowsNest. In `start` mode it opens a
-  PipelineRun (status=started) and returns its runId. In `finalize` mode it
-  closes that run with a terminal status derived from the job result — so a
+  Records a build's lifecycle in CrowsNest. In start mode it opens a
+  PipelineRun (status=started) and returns its runId. In finalize mode it
+  closes that run with a terminal status derived from the job result, so a
   build that fails BEFORE reaching the gate still shows up in CrowsNest as a
-  failed run, not silence.
+  failed run instead of silence.
 author: 'CrowsNest'
 
 inputs:
@@ -21,16 +21,14 @@ inputs:
     description: 'CrowsNest pipeline this build targets'
     required: true
   mode:
-    description: '"start" (open a run) or "finalize" (close it)'
+    description: 'start (open a run) or finalize (close it)'
     required: true
   run-id:
     description: 'Required in finalize mode: the runId returned by the start call'
     required: false
     default: ''
   job-status:
-    description: >
-      finalize mode: the GitHub job status, typically ${{ job.status }}
-      (success | failure | cancelled). Mapped to passed | failed | cancelled.
+    description: 'finalize mode: the GitHub job status (success | failure | cancelled)'
     required: false
     default: ''
   message:
@@ -52,7 +50,7 @@ inputs:
 
 outputs:
   run-id:
-    description: 'start mode: the created run id (pass this to finalize + the gate)'
+    description: 'start mode: the created run id (pass this to finalize and the gate)'
     value: ${{ steps.report.outputs.run-id }}
 
 runs:
@@ -61,22 +59,22 @@ runs:
     - id: report
       shell: bash
       env:
-        CN_API_URL:  ${{ inputs.api-url }}
-        CN_TOKEN:    ${{ inputs.token }}
-        CN_APP_ID:   ${{ inputs.app-id }}
-        CN_PIPE:     ${{ inputs.pipeline-name }}
-        CN_MODE:     ${{ inputs.mode }}
-        CN_RUN_ID:   ${{ inputs.run-id }}
-        CN_JOB:      ${{ inputs.job-status }}
-        CN_MESSAGE:  ${{ inputs.message }}
-        CN_SOURCE:   ${{ inputs.source }}
-        CN_ORG_ID:   ${{ inputs.org-id }}
-        CN_TIMEOUT:  ${{ inputs.timeout-seconds }}
-        GH_REPO:     ${{ github.repository }}
-        GH_SHA:      ${{ github.sha }}
-        GH_REF:      ${{ github.ref_name }}
-        GH_RUNID:    ${{ github.run_id }}
-        GH_ACTOR:    ${{ github.actor }}
+        CN_API_URL: ${{ inputs.api-url }}
+        CN_TOKEN: ${{ inputs.token }}
+        CN_APP_ID: ${{ inputs.app-id }}
+        CN_PIPE: ${{ inputs.pipeline-name }}
+        CN_MODE: ${{ inputs.mode }}
+        CN_RUN_ID: ${{ inputs.run-id }}
+        CN_JOB: ${{ inputs.job-status }}
+        CN_MESSAGE: ${{ inputs.message }}
+        CN_SOURCE: ${{ inputs.source }}
+        CN_ORG_ID: ${{ inputs.org-id }}
+        CN_TIMEOUT: ${{ inputs.timeout-seconds }}
+        GH_REPO: ${{ github.repository }}
+        GH_SHA: ${{ github.sha }}
+        GH_REF: ${{ github.ref_name }}
+        GH_RUNID: ${{ github.run_id }}
+        GH_ACTOR: ${{ github.actor }}
       run: |
         set -euo pipefail
 
@@ -84,54 +82,25 @@ runs:
           echo "::error::app-id must be app-XXXX, got: $CN_APP_ID"; exit 1
         fi
 
-        # ── START ──────────────────────────────────────────────────────────
-        if [[ "$CN_MODE" == "start" ]]; then
-          BODY=$(python3 - <<'PY'
-import json, os
-doc = {
-  "appId":        os.environ["CN_APP_ID"],
-  "pipelineName": os.environ["CN_PIPE"],
-  "source":       os.environ["CN_SOURCE"],
-  "pipelineMeta": {
-    "repository": os.environ.get("GH_REPO",""),
-    "sha":        os.environ.get("GH_SHA",""),
-    "ref":        os.environ.get("GH_REF",""),
-    "runId":      os.environ.get("GH_RUNID",""),
-    "actor":      os.environ.get("GH_ACTOR",""),
-  },
-}
-if os.environ.get("CN_ORG_ID"):
-    doc["orgId"] = os.environ["CN_ORG_ID"]
-print(json.dumps(doc))
-PY
-)
-          RESP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-start.json --max-time "$CN_TIMEOUT" \
+        if [ "$CN_MODE" = "start" ]; then
+          python3 -c 'import json,os; meta={"repository":os.environ.get("GH_REPO",""),"sha":os.environ.get("GH_SHA",""),"ref":os.environ.get("GH_REF",""),"runId":os.environ.get("GH_RUNID",""),"actor":os.environ.get("GH_ACTOR","")}; doc={"appId":os.environ["CN_APP_ID"],"pipelineName":os.environ["CN_PIPE"],"source":os.environ["CN_SOURCE"],"pipelineMeta":meta}; doc.update({"orgId":os.environ["CN_ORG_ID"]} if os.environ.get("CN_ORG_ID") else {}); open("/tmp/cn-start-body.json","w").write(json.dumps(doc))'
+          HTTP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-start.json --max-time "$CN_TIMEOUT" \
             -X POST "$CN_API_URL/api/pipeline/runs/start" \
             -H "Authorization: Bearer $CN_TOKEN" -H "Content-Type: application/json" \
-            -d "$BODY" | tail -1)
-          if [[ "$RESP" != "201" && "$RESP" != "200" ]]; then
-            echo "::error::start failed (HTTP $RESP)"; cat /tmp/cn-start.json; exit 1
+            --data-binary @/tmp/cn-start-body.json | tail -1)
+          if [ "$HTTP" != "201" ] && [ "$HTTP" != "200" ]; then
+            echo "::error::start failed (HTTP $HTTP)"; cat /tmp/cn-start.json; exit 1
           fi
-          RID=$(python3 -c "import json; print(json.load(open('/tmp/cn-start.json'))['runId'])")
+          RID=$(python3 -c 'import json; print(json.load(open("/tmp/cn-start.json"))["runId"])')
           echo "run-id=$RID" >> "$GITHUB_OUTPUT"
           echo "::notice::CrowsNest build run started: $RID"
-          {
-            echo "### CrowsNest — build started"
-            echo ""
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Run id | \`$RID\` |"
-            echo "| App | \`$CN_APP_ID\` |"
-            echo "| Pipeline | \`$CN_PIPE\` |"
-            echo "| Commit | \`${GH_SHA:0:12}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          printf '### CrowsNest — build started\n\n| Field | Value |\n|---|---|\n| Run id | `%s` |\n| App | `%s` |\n| Pipeline | `%s` |\n| Commit | `%s` |\n' "$RID" "$CN_APP_ID" "$CN_PIPE" "${GH_SHA:0:12}" >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
 
-        # ── FINALIZE ───────────────────────────────────────────────────────
-        if [[ "$CN_MODE" == "finalize" ]]; then
-          if [[ -z "$CN_RUN_ID" ]]; then
-            echo "::warning::finalize called with no run-id (start step likely never ran); nothing to finalize."
+        if [ "$CN_MODE" = "finalize" ]; then
+          if [ -z "$CN_RUN_ID" ]; then
+            echo "::warning::finalize called with no run-id; nothing to finalize."
             exit 0
           fi
           case "$CN_JOB" in
@@ -140,33 +109,19 @@ PY
             cancelled) ST="cancelled" ;;
             *)         ST="errored" ;;
           esac
-          BODY=$(python3 - <<PY
-import json, os
-print(json.dumps({
-  "status":  "$ST",
-  "message": os.environ.get("CN_MESSAGE","") or "job.status=$CN_JOB",
-}))
-PY
-)
-          RESP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-final.json --max-time "$CN_TIMEOUT" \
+          MSG="${CN_MESSAGE:-job.status=$CN_JOB}"
+          ST="$ST" MSG="$MSG" python3 -c 'import json,os; open("/tmp/cn-final-body.json","w").write(json.dumps({"status":os.environ["ST"],"message":os.environ["MSG"]}))'
+          HTTP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-final.json --max-time "$CN_TIMEOUT" \
             -X POST "$CN_API_URL/api/pipeline/runs/$CN_RUN_ID/finalize" \
             -H "Authorization: Bearer $CN_TOKEN" -H "Content-Type: application/json" \
-            -d "$BODY" | tail -1)
-          if [[ "$RESP" != "200" ]]; then
-            echo "::warning::finalize failed (HTTP $RESP)"; cat /tmp/cn-final.json
-            exit 0   # never fail the job just because reporting failed
+            --data-binary @/tmp/cn-final-body.json | tail -1)
+          if [ "$HTTP" != "200" ]; then
+            echo "::warning::finalize failed (HTTP $HTTP)"; cat /tmp/cn-final.json; exit 0
           fi
           echo "::notice::CrowsNest build run $CN_RUN_ID finalized: $ST"
-          {
-            echo "### CrowsNest — build finalized: \`$ST\`"
-            echo ""
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Run id | \`$CN_RUN_ID\` |"
-            echo "| Job status | \`$CN_JOB\` → \`$ST\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          printf '### CrowsNest — build finalized: `%s`\n\n| Field | Value |\n|---|---|\n| Run id | `%s` |\n| Job status | `%s` |\n' "$ST" "$CN_RUN_ID" "$CN_JOB" >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
 
-        echo "::error::mode must be 'start' or 'finalize', got: $CN_MODE"
+        echo "::error::mode must be start or finalize, got: $CN_MODE"
         exit 1
