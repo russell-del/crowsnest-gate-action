@@ -31,7 +31,6 @@ jobs:
       contents: read
       actions: read
       security-events: read
-      administration: read
     steps:
       - uses: actions/checkout@v4
 

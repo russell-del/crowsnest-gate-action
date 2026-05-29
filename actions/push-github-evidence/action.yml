@@ -71,7 +71,11 @@ runs:
         fi
         echo "Querying real GitHub posture for $CN_REPO (branch $CN_BRANCH)"
 
-        if gh api "repos/$CN_REPO/branches/$CN_BRANCH/protection" >/dev/null 2>&1; then PROT=true; else PROT=false; fi
+        # The branches endpoint exposes `.protected` with only contents:read —
+        # unlike the /protection sub-resource which requires admin. This lets the
+        # default workflow GITHUB_TOKEN read real protection state.
+        PROT=$(gh api "repos/$CN_REPO/branches/$CN_BRANCH" --jq '.protected' 2>/dev/null || echo false)
+        [ "$PROT" = "true" ] || PROT=false
 
         CODEOWNERS=false
         for p in ".github/CODEOWNERS" "CODEOWNERS" "docs/CODEOWNERS"; do
