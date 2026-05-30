@@ -52,23 +52,25 @@ runs:
           echo "::error::app-id must be app-XXXX, got: $CN_APP_ID"; exit 1
         fi
         echo "Refreshing live crows for $CN_APP_ID via $CN_API_URL"
-        printf '### CrowsNest — live crow refresh (%s)\n\n| Crow | Status |\n|---|---|\n' "$CN_APP_ID" >> "$GITHUB_STEP_SUMMARY"
+        printf '### CrowsNest — live crow refresh (%s)\n\n| Crow id | HTTP | records |\n|---|---|---|\n' "$CN_APP_ID" >> "$GITHUB_STEP_SUMMARY"
+        FAILS=0
         IFS=',' read -ra IDS <<< "$CN_CROW_IDS"
         for CID in "${IDS[@]}"; do
           BODY="{\"orgId\":\"$CN_ORG_ID\",\"appIds\":[\"$CN_APP_ID\"]}"
-          RESP=$(curl -sS -m "$CN_TIMEOUT" -X POST "$CN_API_URL/api/crows/$CID/run" \
+          CODE=$(curl -sS -m "$CN_TIMEOUT" -o /tmp/crow_resp.json -w "%{http_code}" \
+            -X POST "$CN_API_URL/api/crows/$CID/run" \
             -H "Authorization: Bearer $CN_TOKEN" -H "Content-Type: application/json" \
-            -d "$BODY" 2>/dev/null || echo '{}')
-          NAME=$(printf '%s' "$RESP" | python3 -c "import sys,json
-try:
-  d=json.load(sys.stdin); print(d.get('results',[{}])[0].get('crow','?'))
-except Exception: print('?')" 2>/dev/null)
-          STAT=$(printf '%s' "$RESP" | python3 -c "import sys,json
-try:
-  d=json.load(sys.stdin); print(d.get('results',[{}])[0].get('status','no-status'))
-except Exception: print('parse-fail')" 2>/dev/null)
-          echo "  $CID -> $NAME : $STAT"
-          printf '| %s | %s |\n' "$NAME" "$STAT" >> "$GITHUB_STEP_SUMMARY"
+            -d "$BODY" 2>/dev/null || echo "000")
+          # records_processed for this app, parsed by jq (always present on runners)
+          RECS=$(jq -r --arg a "$CN_APP_ID" '
+            [ .results[]?.application_results[]? | select(.app_id==$a) | .records_processed ] | add // "n/a"
+          ' /tmp/crow_resp.json 2>/dev/null || echo "n/a")
+          echo "  crow $CID -> HTTP $CODE records=$RECS"
+          printf '| %s | %s | %s |\n' "$CID" "$CODE" "$RECS" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$CODE" != "200" ]; then FAILS=$((FAILS+1)); fi
         done
         echo "Waiting ${CN_SETTLE}s for extraction to settle..."
         sleep "$CN_SETTLE"
+        if [ "$FAILS" -gt 0 ]; then
+          echo "::warning::$FAILS crow run(s) did not return HTTP 200; gates may see stale data."
+        fi
