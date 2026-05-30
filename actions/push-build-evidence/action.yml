@@ -1,0 +1,58 @@
+name: 'CrowsNest — push build evidence'
+description: >
+  Generic build-evidence pusher. Takes a data-type and a studiodata JSON file
+  (already shaped by a tool-specific transformer), wraps it in the CrowsNest
+  crowdata envelope, and POSTs it to /api/crowdata. Used for secret_scan,
+  dep_scan, test_results, coverage, and image_build evidence.
+author: 'CrowsNest'
+
+inputs:
+  api-url: { description: 'CrowsNest api-server base URL', required: true }
+  token: { description: 'CrowsNest Bearer JWT', required: true }
+  app-id: { description: 'CrowsNest application id (app-XXXX)', required: true }
+  org-id: { description: 'CrowsNest orgId', required: true }
+  crow-id: { description: 'Passive crow id this evidence is attributed to', required: true }
+  data-type: { description: 'Evidence data_type (secret_scan|dep_scan|test_results|coverage|image_build)', required: true }
+  studiodata-file: { description: 'Path to a JSON file containing the studiodata object', required: true }
+  timeout-seconds: { description: 'HTTP timeout', required: false, default: '30' }
+
+outputs:
+  crowdata-id:
+    description: 'MongoDB _id of the created crowdata document'
+    value: ${{ steps.push.outputs.crowdata-id }}
+
+runs:
+  using: composite
+  steps:
+    - id: push
+      shell: bash
+      env:
+        CN_API_URL: ${{ inputs.api-url }}
+        CN_TOKEN: ${{ inputs.token }}
+        CN_APP_ID: ${{ inputs.app-id }}
+        CN_ORG_ID: ${{ inputs.org-id }}
+        CN_CROW_ID: ${{ inputs.crow-id }}
+        CN_DATA_TYPE: ${{ inputs.data-type }}
+        CN_STUDIODATA_FILE: ${{ inputs.studiodata-file }}
+        CN_TIMEOUT: ${{ inputs.timeout-seconds }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -uo pipefail
+        if [[ ! "$CN_APP_ID" =~ ^app-[A-Za-z0-9]{4}$ ]]; then
+          echo "::error::app-id must be app-XXXX, got: $CN_APP_ID"; exit 1
+        fi
+        if [ ! -f "$CN_STUDIODATA_FILE" ]; then
+          echo "::error::studiodata file not found: $CN_STUDIODATA_FILE"; exit 1
+        fi
+        export OUT_FILE=/tmp/cn-build-ev.json
+        python3 "$ACTION_DIR/scripts/wrap_evidence.py"
+        HTTP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-build-resp.json --max-time "$CN_TIMEOUT" \
+          -X POST "$CN_API_URL/api/crowdata" \
+          -H "Authorization: Bearer $CN_TOKEN" -H "Content-Type: application/json" \
+          --data-binary @/tmp/cn-build-ev.json | tail -1)
+        if [ "$HTTP" != "200" ]; then
+          echo "::error::CrowsNest rejected $CN_DATA_TYPE evidence (HTTP $HTTP)"; cat /tmp/cn-build-resp.json; exit 1
+        fi
+        RID=$(python3 -c "import json;print(json.load(open('/tmp/cn-build-resp.json'))['_id'])")
+        echo "crowdata-id=$RID" >> "$GITHUB_OUTPUT"
+        echo "::notice::$CN_DATA_TYPE evidence pushed: $RID"
