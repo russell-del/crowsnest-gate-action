@@ -48,9 +48,10 @@ jobs:
       - name: 'Refresh live crows (real backend extraction)'
         uses: ./actions/refresh-crows
         with:
-          host:   ${{ env.CN_HOST }}
-          app-id: ${{ env.CN_APP }}
-          org-id: ${{ env.CN_ORG }}
+          api-url: ${{ vars.CROWSNEST_PUBLIC_API_URL }}
+          token:   ${{ secrets.CROWSNEST_PUBLIC_TOKEN }}
+          app-id:  ${{ env.CN_APP }}
+          org-id:  ${{ env.CN_ORG }}
 
       - name: 'Push GitHub posture (real gh api)'
         uses: ./actions/push-github-evidence

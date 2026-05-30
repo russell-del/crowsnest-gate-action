@@ -1,14 +1,18 @@
 name: 'CrowsNest — refresh live crows'
 description: >
   Triggers the live CrowsNest crows (TLS, MSSQL, AD, VMware, Defender XDR) to
-  re-extract real posture from the backend systems for an application, so the
-  gate evaluates fresh data instead of stale data. Each crow /trigger endpoint
-  is reachable on its published port on the CrowsNest host.
+  re-extract real posture from the backend systems for an application, via the
+  public api-server endpoint POST /api/crows/:id/run, so the gate evaluates
+  fresh data. (The crows' own :180xx trigger ports are not publicly exposed —
+  the api-server on :18000 is the supported public entry point.)
 author: 'CrowsNest'
 
 inputs:
-  host:
-    description: 'CrowsNest host (no scheme), e.g. 152.228.243.192'
+  api-url:
+    description: 'Base URL of the CrowsNest api-server, e.g. http://152.228.243.192:18000'
+    required: true
+  token:
+    description: 'CrowsNest Bearer JWT'
     required: true
   app-id:
     description: 'CrowsNest application id (app-XXXX) to extract for'
@@ -16,10 +20,14 @@ inputs:
   org-id:
     description: 'CrowsNest orgId'
     required: true
-  crows:
-    description: 'Comma-separated port:crowId entries to trigger (defaults to the 5 standard live crows).'
+  crow-ids:
+    description: 'Comma-separated crow ObjectIds to run (defaults to the 5 standard live crows).'
     required: false
-    default: '18080:69e2a421b895411778d8cfb0,18090:69e2a421b895411778d8cfb8,18094:69e2a421b895411778d8cfc0,18093:69e2a421b895411778d8cfc8,18092:69e2a421b895411778d8cfd0'
+    default: '69e2a421b895411778d8cfb0,69e2a421b895411778d8cfb8,69e2a421b895411778d8cfc0,69e2a421b895411778d8cfc8,69e2a421b895411778d8cfd0'
+  settle-seconds:
+    description: 'Seconds to wait after triggering, so extraction completes before gates run.'
+    required: false
+    default: '8'
   timeout-seconds:
     description: 'Per-crow HTTP timeout'
     required: false
@@ -31,34 +39,36 @@ runs:
     - id: refresh
       shell: bash
       env:
-        CN_HOST: ${{ inputs.host }}
+        CN_API_URL: ${{ inputs.api-url }}
+        CN_TOKEN: ${{ inputs.token }}
         CN_APP_ID: ${{ inputs.app-id }}
         CN_ORG_ID: ${{ inputs.org-id }}
-        CN_CROWS: ${{ inputs.crows }}
+        CN_CROW_IDS: ${{ inputs.crow-ids }}
+        CN_SETTLE: ${{ inputs.settle-seconds }}
         CN_TIMEOUT: ${{ inputs.timeout-seconds }}
       run: |
         set -uo pipefail
         if [[ ! "$CN_APP_ID" =~ ^app-[A-Za-z0-9]{4}$ ]]; then
           echo "::error::app-id must be app-XXXX, got: $CN_APP_ID"; exit 1
         fi
-        echo "Refreshing live crows for $CN_APP_ID on $CN_HOST"
-        printf '### CrowsNest — live crow refresh (%s)\n\n| Crow | Records |\n|---|---|\n' "$CN_APP_ID" >> "$GITHUB_STEP_SUMMARY"
-        FAILED=0
-        IFS=',' read -ra ENTRIES <<< "$CN_CROWS"
-        for e in "${ENTRIES[@]}"; do
-          PORT="${e%%:*}"; CID="${e##*:}"
-          BODY="{\"orgId\":\"$CN_ORG_ID\",\"crowId\":\"$CID\",\"appIds\":[\"$CN_APP_ID\"]}"
-          RESP=$(curl -sS -m "$CN_TIMEOUT" -X POST "http://$CN_HOST:$PORT/trigger" -H "Content-Type: application/json" -d "$BODY" 2>/dev/null || echo '{}')
-          NAME=$(echo "$RESP" | python3 -c "import sys,json
-try: print(json.load(sys.stdin).get('crow_name','?'))
-except: print('?')" 2>/dev/null)
-          RECS=$(echo "$RESP" | python3 -c "import sys,json
-try: print(json.load(sys.stdin).get('total_records_processed','ERR'))
-except: print('ERR')" 2>/dev/null)
-          echo "  port $PORT -> $NAME : records=$RECS"
-          printf '| %s (:%s) | %s |\n' "$NAME" "$PORT" "$RECS" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$RECS" = "ERR" ]; then FAILED=$((FAILED+1)); fi
+        echo "Refreshing live crows for $CN_APP_ID via $CN_API_URL"
+        printf '### CrowsNest — live crow refresh (%s)\n\n| Crow | Status |\n|---|---|\n' "$CN_APP_ID" >> "$GITHUB_STEP_SUMMARY"
+        IFS=',' read -ra IDS <<< "$CN_CROW_IDS"
+        for CID in "${IDS[@]}"; do
+          BODY="{\"orgId\":\"$CN_ORG_ID\",\"appIds\":[\"$CN_APP_ID\"]}"
+          RESP=$(curl -sS -m "$CN_TIMEOUT" -X POST "$CN_API_URL/api/crows/$CID/run" \
+            -H "Authorization: Bearer $CN_TOKEN" -H "Content-Type: application/json" \
+            -d "$BODY" 2>/dev/null || echo '{}')
+          NAME=$(printf '%s' "$RESP" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin); print(d.get('results',[{}])[0].get('crow','?'))
+except Exception: print('?')" 2>/dev/null)
+          STAT=$(printf '%s' "$RESP" | python3 -c "import sys,json
+try:
+  d=json.load(sys.stdin); print(d.get('results',[{}])[0].get('status','no-status'))
+except Exception: print('parse-fail')" 2>/dev/null)
+          echo "  $CID -> $NAME : $STAT"
+          printf '| %s | %s |\n' "$NAME" "$STAT" >> "$GITHUB_STEP_SUMMARY"
         done
-        if [ "$FAILED" -gt 0 ]; then
-          echo "::warning::$FAILED crow(s) returned no record count; gate may see stale data."
-        fi
+        echo "Waiting ${CN_SETTLE}s for extraction to settle..."
+        sleep "$CN_SETTLE"

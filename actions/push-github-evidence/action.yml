@@ -64,6 +64,7 @@ runs:
         CN_CROW_ID: ${{ inputs.crow-id }}
         CN_TIMEOUT: ${{ inputs.timeout-seconds }}
         GH_TOKEN: ${{ inputs.github-token }}
+        ACTION_DIR: ${{ github.action_path }}
       run: |
         set -uo pipefail
         if [[ ! "$CN_APP_ID" =~ ^app-[A-Za-z0-9]{4}$ ]]; then
@@ -71,9 +72,8 @@ runs:
         fi
         echo "Querying real GitHub posture for $CN_REPO (branch $CN_BRANCH)"
 
-        # The branches endpoint exposes `.protected` with only contents:read —
-        # unlike the /protection sub-resource which requires admin. This lets the
-        # default workflow GITHUB_TOKEN read real protection state.
+        # Branch protection: the branches endpoint exposes `.protected` with only
+        # contents:read, unlike the admin-only /protection sub-resource.
         PROT=$(gh api "repos/$CN_REPO/branches/$CN_BRANCH" --jq '.protected' 2>/dev/null || echo false)
         [ "$PROT" = "true" ] || PROT=false
 
@@ -82,49 +82,22 @@ runs:
           if gh api "repos/$CN_REPO/contents/$p" >/dev/null 2>&1; then CODEOWNERS=true; break; fi
         done
 
+        OPEN_ALERTS=0
         if gh api "repos/$CN_REPO/secret-scanning/alerts?state=open" >/tmp/gh_ss.json 2>/dev/null; then
           OPEN_ALERTS=$(python3 -c "import json;d=json.load(open('/tmp/gh_ss.json'));print(len(d) if isinstance(d,list) else 0)")
-        else
-          OPEN_ALERTS=0
         fi
 
         WF_TOTAL=0; WF_RATE=0
         if gh api "repos/$CN_REPO/actions/workflows/$CN_REQ_WF/runs?branch=$CN_BRANCH&status=completed&per_page=1" >/tmp/gh_wf.json 2>/dev/null; then
-          read WF_TOTAL WF_RATE < <(python3 -c "
-import json
-d=json.load(open('/tmp/gh_wf.json'))
-r=d.get('workflow_runs',[])
-print('0 0' if not r else '1 ' + ('1.0' if r[0]['conclusion']=='success' else '0.0'))
-")
+          set -- $(python3 "$ACTION_DIR/scripts/parse_wf_runs.py" /tmp/gh_wf.json)
+          WF_TOTAL="$1"; WF_RATE="$2"
         fi
 
-        REQ_WF_NAME="$(basename "$CN_REQ_WF" .yml)"
-        echo "  branchProtection=$PROT codeowners=$CODEOWNERS openAlerts=$OPEN_ALERTS reqWf=$REQ_WF_NAME total=$WF_TOTAL rate=$WF_RATE"
+        export CN_REPO CN_ORG_ID CN_APP_ID CN_CROW_ID PROT CODEOWNERS OPEN_ALERTS WF_TOTAL WF_RATE
+        export REQ_WF_NAME="$(basename "$CN_REQ_WF" .yml)"
+        export OUT_FILE=/tmp/cn-gh.json
+        python3 "$ACTION_DIR/scripts/build_github_evidence.py"
 
-        PROT="$PROT" CODEOWNERS="$CODEOWNERS" OPEN_ALERTS="$OPEN_ALERTS" \
-        WF_TOTAL="$WF_TOTAL" WF_RATE="$WF_RATE" REQ_WF_NAME="$REQ_WF_NAME" \
-        python3 -c '
-import json, os
-repo = os.environ["CN_REPO"]
-sd = { repo: {
-  "branchProtection": { "enabled": os.environ["PROT"] == "true" },
-  "codeowners": { "present": os.environ["CODEOWNERS"] == "true" },
-  "secretScanning": { "openAlerts": int(os.environ["OPEN_ALERTS"]) },
-  "workflowRuns": { "workflows": { os.environ["REQ_WF_NAME"]: {
-    "totalCount": int(os.environ["WF_TOTAL"]),
-    "successRate": float(os.environ["WF_RATE"]),
-  }}},
-}}
-doc = {
-  "orgId": os.environ["CN_ORG_ID"],
-  "appId": os.environ["CN_APP_ID"],
-  "crowId": os.environ["CN_CROW_ID"],
-  "data": { "applications": { os.environ["CN_APP_ID"]: { "query_results": [
-    { "result": { "data_type": "github_posture", "studiodata": sd } }
-  ]}}},
-}
-json.dump(doc, open("/tmp/cn-gh.json","w"))
-'
         HTTP=$(curl -sS -w "\n%{http_code}" -o /tmp/cn-gh-resp.json --max-time "$CN_TIMEOUT" \
           -X POST "$CN_API_URL/api/crowdata" \
           -H "Authorization: Bearer $CN_TOKEN" -H "Content-Type: application/json" \
@@ -135,5 +108,5 @@ json.dump(doc, open("/tmp/cn-gh.json","w"))
         RID=$(python3 -c "import json;print(json.load(open('/tmp/cn-gh-resp.json'))['_id'])")
         echo "crowdata-id=$RID" >> "$GITHUB_OUTPUT"
         echo "::notice::GitHub posture pushed: $RID"
-        printf '### CrowsNest — GitHub posture pushed\n\n| Field | Value |\n|---|---|\n| Repo | `%s` |\n| Branch protection | `%s` |\n| CODEOWNERS | `%s` |\n| Open secret alerts | `%s` |\n| Required workflow | `%s` rate=%s |\n| Document id | `%s` |\n' \
-          "$CN_REPO" "$PROT" "$CODEOWNERS" "$OPEN_ALERTS" "$REQ_WF_NAME" "$WF_RATE" "$RID" >> "$GITHUB_STEP_SUMMARY"
+        printf '### CrowsNest — GitHub posture pushed\n\n| Field | Value |\n|---|---|\n| Repo | `%s` |\n| Branch protection | `%s` |\n| CODEOWNERS | `%s` |\n| Open secret alerts | `%s` |\n| Required workflow rate | `%s` |\n| Document id | `%s` |\n' \
+          "$CN_REPO" "$PROT" "$CODEOWNERS" "$OPEN_ALERTS" "$WF_RATE" "$RID" >> "$GITHUB_STEP_SUMMARY"
